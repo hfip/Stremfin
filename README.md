@@ -1,5 +1,12 @@
 # Stremfin
 
+> [!WARNING]
+> **⚠️ Notice: Work in Progress & Active Beta Testing**  
+> This bridge is currently under active development. Season navigation, catalog browsing, and playback endpoints are undergoing continuous optimization. You may encounter temporary instability or missing items.
+>
+> **⚠️ تنبيه: المشروع قيد التطوير والتجربة النشطة**  
+> هذا الخادم في مرحلة تجريبية غير مكتملة (Beta). استعراض الحلقات وتصفح الكتالوجات يخضعان للتحسين المستمر، وقد تواجه بعض الأخطاء أو عدم الاستقرار أثناء المشاهدة والتنقل.
+
 Stremfin is a lightweight, open-source Python bridge that emulates the subset of the Jellyfin Server API needed by clients such as Infuse and VidHub. It resolves playable media URLs from configured Stremio addons and optionally passes links through Real-Debrid or TorBox.
 
 ## Features

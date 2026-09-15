@@ -15,6 +15,8 @@ Stremfin is a lightweight, open-source Python bridge that emulates the subset of
 - Live catalog discovery from configured Stremio manifests, selected catalog persistence, artwork, provider IDs, and series episode DTOs.
 - Subtitle addon resolution with Arabic/English normalization and Jellyfin external subtitle proxy routes.
 - Jellyfin primary/backdrop image proxy endpoints for Infuse and VidHub.
+- 30-minute asynchronous LRU/TTL caching for live manifests, catalogs, and metadata lookups.
+- Exact Jellyfin season and episode DTO fields for client navigation compatibility.
 - Episode-aware stream resolution using `series-id:s1e1` item IDs.
 - No mock catalog, media URL, or hardcoded content is used; configured live addons are required.
 
@@ -50,6 +52,8 @@ curl -X POST http://localhost:3000/Users/AuthenticateByName \
 ## API notes
 
 The dashboard fetches every configured addon manifest, exposes its real catalogs as checkboxes, and persists the selected catalog descriptors. `GET /api/catalog/movie` and `/api/catalog/series` query only those selected live catalogs. Jellyfin `/Items` routes normalize those results into client-friendly DTOs with posters, backdrops, overviews, years, and provider IDs. Series seasons and episodes are taken from the addon's live `/meta/{type}/{id}.json` response.
+
+Catalog browsing is cached for 30 minutes in memory to avoid duplicate addon requests while clients scroll. `IncludeItemTypes=Movie` and `IncludeItemTypes=Series` are handled as strict filters, and `ParentId=movies` or `ParentId=tvshows` selects the corresponding catalog type. The dashboard shows catalog names and types without exposing raw addon URLs.
 
 The dashboard stores separate stream and subtitle addon lists. Subtitle tracks are exposed as Jellyfin `MediaStreams` with `DeliveryMethod: External`, normalized `eng`/`ara` language codes, and proxy URLs such as `/Subtitles/{itemId}/{index}/Stream.srt`. Artwork is available through `/Items/{itemId}/Images/Primary` and `/Items/{itemId}/Images/Backdrop`.
 

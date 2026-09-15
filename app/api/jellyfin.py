@@ -1,12 +1,14 @@
 """Minimal Jellyfin Server API compatibility layer for media clients."""
 from uuid import uuid4
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, Response
+import httpx
 from app.config import Settings, get_settings
 from app.services.debrid import DebridResolver
 from app.services.metadata import MetadataService
 from app.services.settings_store import SettingsStore
 from app.services.stremio import StremioResolver
+from app.services.subtitles import SubtitleResolver
 
 router = APIRouter()
 USER_ID = "stremfin-user"
@@ -15,7 +17,7 @@ TOKENS: set[str] = set()
 
 def _runtime_settings(settings: Settings) -> Settings:
     configured = SettingsStore(settings.database_path).load()
-    return settings.model_copy(update={"debrid_provider": configured.debrid_provider, "real_debrid_api_key": configured.debrid_api_key or settings.real_debrid_api_key, "torbox_api_key": configured.debrid_api_key or settings.torbox_api_key, "tmdb_api_key": configured.tmdb_api_key or settings.tmdb_api_key, "stremio_addon_urls": ",".join(configured.stremio_addon_urls)})
+    return settings.model_copy(update={"debrid_provider": configured.debrid_provider, "real_debrid_api_key": configured.debrid_api_key or settings.real_debrid_api_key, "torbox_api_key": configured.debrid_api_key or settings.torbox_api_key, "tmdb_api_key": configured.tmdb_api_key or settings.tmdb_api_key, "stremio_addon_urls": ",".join(configured.stream_addon_urls), "subtitle_addon_urls": ",".join(configured.subtitle_addon_urls)})
 
 
 def _server_info(settings: Settings) -> dict:
@@ -25,10 +27,10 @@ def _server_info(settings: Settings) -> dict:
 def _item(meta: dict, collection_type: str) -> dict:
     is_series = meta["type"] == "Series"
     item_id = meta["imdb_id"] or meta["id"]
-    image_tags = {}
-    dto = {"Name": meta["name"], "ServerId": "stremfin", "Id": item_id, "Type": "Series" if is_series else "Movie", "CollectionType": collection_type, "IsFolder": is_series, "RunTimeTicks": None if is_series else 72000000000, "ProductionYear": meta.get("year"), "Overview": meta.get("overview", ""), "ImageTags": image_tags, "BackdropImageTags": [], "LocationType": "Remote", "ProviderIds": {"Imdb": meta.get("imdb_id", "")}, "MediaSources": [] if is_series else [{"Id": item_id, "Name": meta["name"], "Path": item_id, "Protocol": "Http", "Type": "Default", "SupportsDirectPlay": True, "SupportsDirectStream": True, "SupportsTranscoding": False, "IsRemote": True}]}
+    image_tags = {"Primary": "stremfin-primary", "Backdrop": "stremfin-backdrop"}
+    dto = {"Name": meta["name"], "ServerId": "stremfin", "Id": item_id, "Type": "Series" if is_series else "Movie", "CollectionType": collection_type, "IsFolder": is_series, "RunTimeTicks": None if is_series else 72000000000, "ProductionYear": meta.get("year"), "Overview": meta.get("overview", ""), "ImageTags": image_tags, "PrimaryImageTag": "stremfin-primary", "BackdropImageTags": ["stremfin-backdrop"], "LocationType": "Remote", "ProviderIds": {"Imdb": meta.get("imdb_id", "")}, "MediaStreams": [], "MediaSources": [] if is_series else [{"Id": item_id, "Name": meta["name"], "Path": item_id, "Protocol": "Http", "Type": "Default", "SupportsDirectPlay": True, "SupportsDirectStream": True, "SupportsTranscoding": False, "IsRemote": True}]}
     if meta.get("poster"): dto["ImageSources"] = [{"Type": "Primary", "Url": meta["poster"]}]
-    if meta.get("backdrop"): dto.setdefault("BackdropImageSources", [{"Type": "Backdrop", "Url": meta["backdrop"]}])
+    if meta.get("backdrop"): dto["BackdropImageSources"] = [{"Type": "Backdrop", "Url": meta["backdrop"]}]
     return dto
 
 
@@ -73,8 +75,41 @@ async def get_items(user_id: str | None = None, parent_id: str | None = Query(No
             episodes = [{"Name": f"Episode {number}", "ServerId": "stremfin", "Id": f"{parent_id}:s1e{number}", "Type": "Episode", "SeriesId": parent_id, "ParentIndexNumber": 1, "IndexNumber": number, "IsFolder": False} for number in range(1, 11)]
             return {"Items": episodes, "TotalRecordCount": len(episodes), "StartIndex": 0}
     metas = await MetadataService(runtime).catalog(kind, min(limit, 100))
-    items = [_item(meta, "tvshows" if meta["type"] == "Series" else "movies") for meta in metas]
+    items = []
+    for meta in metas:
+        dto = _item(meta, "tvshows" if meta["type"] == "Series" else "movies")
+        subtitles = await SubtitleResolver(runtime).resolve(meta.get("imdb_id") or meta["id"])
+        dto["MediaStreams"] = [{"Type": "Subtitle", "Language": sub.language, "DisplayTitle": sub.title, "DeliveryMethod": "External", "DeliveryUrl": f"/Subtitles/{dto['Id']}/{index}/Stream.{sub.format}"} for index, sub in enumerate(subtitles)]
+        items.append(dto)
     return {"Items": items, "TotalRecordCount": len(items), "StartIndex": 0}
+
+
+async def _image(item_id: str, image_type: str):
+    runtime = _runtime_settings(get_settings())
+    meta = await MetadataService(runtime).details(item_id, "series") or await MetadataService(runtime).details(item_id, "movie")
+    url = meta.get("backdrop" if image_type == "Backdrop" else "poster") if meta else None
+    if not url: raise HTTPException(404, "Image not found")
+    return RedirectResponse(url, status_code=302)
+
+
+@router.get("/Items/{item_id}/Images/Primary")
+async def primary_image(item_id: str): return await _image(item_id, "Primary")
+
+
+@router.get("/Items/{item_id}/Images/Backdrop")
+async def backdrop_image(item_id: str): return await _image(item_id, "Backdrop")
+
+
+@router.get("/Subtitles/{item_id}/{index}/Stream.{format}")
+async def subtitle_stream(item_id: str, index: int, format: str):
+    parts = item_id.split(":"); content_id, season, episode = parts[0], None, None
+    if len(parts) == 2 and parts[1].startswith("s1e"): season, episode = 1, int(parts[1][3:])
+    runtime = _runtime_settings(get_settings()); candidates = await SubtitleResolver(runtime).resolve(content_id, season, episode)
+    if index >= len(candidates): raise HTTPException(404, "Subtitle not found")
+    async with httpx.AsyncClient(timeout=runtime.request_timeout_seconds, follow_redirects=True) as client:
+        response = await client.get(candidates[index].url); response.raise_for_status()
+    media_type = "text/vtt" if format.lower() == "vtt" else "application/x-subrip"
+    return Response(response.content, media_type=media_type, headers={"Content-Disposition": f'inline; filename="{item_id}.{format}"'})
 
 
 @router.get("/Videos/{item_id}/stream")

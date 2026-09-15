@@ -8,6 +8,7 @@ client = TestClient(app)
 
 def test_dashboard_and_settings_persist(tmp_path):
     assert client.get("/").status_code == 200
+    client.post("/api/login", json={"username": "admin", "password": "admin"})
     original = store.path
     store.path = Path(tmp_path) / "settings.db"
     store._init_db()

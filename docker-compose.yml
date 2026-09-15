@@ -1,0 +1,9 @@
+services:
+  stremfin:
+    build: .
+    container_name: stremfin
+    env_file:
+      - .env
+    ports:
+      - "3001:3000"
+    restart: unless-stopped

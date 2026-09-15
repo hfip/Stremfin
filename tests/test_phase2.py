@@ -20,7 +20,7 @@ def test_dashboard_and_settings_persist(tmp_path):
 
 
 def test_catalog_route_returns_normalized_items(monkeypatch):
-    async def fake_catalog(self, kind, limit=20):
+    async def fake_catalog(self, kind, limit=20, selected=None):
         return [{"id": "tt1", "imdb_id": "tt1", "name": "Real Title", "type": "Series", "overview": "A story", "year": 2025, "poster": "https://img/p.jpg", "backdrop": "https://img/b.jpg"}]
     monkeypatch.setattr("app.main.MetadataService.catalog", fake_catalog)
     payload = client.get("/api/catalog/series").json()
@@ -33,4 +33,4 @@ def test_episode_id_is_accepted(monkeypatch):
         return []
     monkeypatch.setattr("app.api.jellyfin.StremioResolver.resolve", no_stream)
     response = client.get("/Videos/tt1:s1e2/stream", follow_redirects=False)
-    assert response.status_code == 302
+    assert response.status_code == 404

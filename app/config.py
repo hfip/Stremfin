@@ -15,12 +15,10 @@ class Settings(BaseSettings):
     debrid_provider: str = "none"
     real_debrid_api_key: str | None = None
     torbox_api_key: str | None = None
-    tmdb_api_key: str | None = None
     database_path: str = "./data/stremfin.db"
     dashboard_username: str = "admin"
     dashboard_password: str = "admin"
     dashboard_session_secret: str = "change-me-in-production"
-    fallback_stream_url: str = "https://storage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
     request_timeout_seconds: float = 20.0
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

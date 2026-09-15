@@ -11,8 +11,8 @@ class AppSettings(BaseModel):
     stream_addon_urls: list[str] = Field(default_factory=list)
     subtitle_addon_urls: list[str] = Field(default_factory=list)
     selected_catalogs: list[dict] = Field(default_factory=list)
-    preferred_resolutions: list[str] = Field(default_factory=list)
-    preferred_audio_formats: list[str] = Field(default_factory=list)
+    preferred_resolutions: list[str] = Field(default_factory=lambda: ["4K", "1080p"])
+    preferred_audio_formats: list[str] = Field(default_factory=lambda: ["EAC3", "AC3", "AAC"])
 
     @property
     def stremio_addon_urls(self) -> list[str]: return self.stream_addon_urls

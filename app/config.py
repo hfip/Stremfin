@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     def addon_urls(self) -> list[str]:
         values = [self.stremio_addon_url] if self.stremio_addon_url else []
         values.extend(item.strip() for item in self.stremio_addon_urls.split(","))
-        return [item.rstrip("/") for item in values if item.strip()]
+        return [item.removesuffix("/manifest.json").rstrip("/") for item in values if item.strip()]
 
 
 @lru_cache

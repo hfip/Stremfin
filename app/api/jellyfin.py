@@ -22,10 +22,10 @@ def _server_info(settings): return {"LocalAddress": settings.public_base_url, "S
 
 
 def _item(meta, collection):
-    item_id = meta.get("id"); series = meta.get("type") == "Series"
+    item_id = meta.get("imdb_id") or meta.get("id"); series = meta.get("type") == "Series"
     dto = {"Name": meta.get("name"), "ServerId": "stremfin", "Id": item_id, "Type": "Series" if series else "Movie", "CollectionType": collection, "IsFolder": series, "RunTimeTicks": int(float(meta["runtime"]) * 600000000) if str(meta.get("runtime", "")).replace(".", "", 1).isdigit() else None, "ProductionYear": meta.get("year"), "Overview": meta.get("overview", ""), "ImageTags": {}, "BackdropImageTags": [], "LocationType": "Remote", "ProviderIds": {"Imdb": meta.get("imdb_id")} if meta.get("imdb_id") else {}, "MediaStreams": [], "MediaSources": [] if series else [{"Id": item_id, "Name": meta.get("name"), "Path": item_id, "Protocol": "Http", "Type": "Default", "SupportsDirectPlay": True, "SupportsDirectStream": True, "SupportsTranscoding": False, "IsRemote": True}]}
-    if meta.get("poster"): dto.update({"PrimaryImageTag": "live", "ImageTags": {"Primary": "live"}, "ImageSources": [{"Type": "Primary", "Url": meta["poster"]}]})
-    if meta.get("backdrop"): dto.update({"BackdropImageTags": ["live"], "BackdropImageSources": [{"Type": "Backdrop", "Url": meta["backdrop"]}]})
+    if meta.get("poster"): dto.update({"PrimaryImageTag": "live", "ImageTags": {"Primary": "live"}, "ImageSources": [{"Type": "Primary", "Url": f"/Items/{item_id}/Images/Primary"}]})
+    if meta.get("backdrop"): dto.update({"BackdropImageTags": ["live"], "BackdropImageSources": [{"Type": "Backdrop", "Url": f"/Items/{item_id}/Images/Backdrop"}]})
     return dto
 
 
@@ -44,6 +44,11 @@ async def get_user(user_id: str):
 @router.get("/Users/{user_id}/Views")
 async def get_views(user_id: str):
     if user_id != USER_ID: raise HTTPException(404, "User not found")
+    return {"Items": [{"Name": "Movies", "ServerId": "stremfin", "Id": "movies", "Type": "CollectionFolder", "CollectionType": "movies", "IsFolder": True}, {"Name": "TV Shows", "ServerId": "stremfin", "Id": "tvshows", "Type": "CollectionFolder", "CollectionType": "tvshows", "IsFolder": True}], "TotalRecordCount": 2, "StartIndex": 0}
+
+
+@router.get("/UserViews")
+async def user_views():
     return {"Items": [{"Name": "Movies", "ServerId": "stremfin", "Id": "movies", "Type": "CollectionFolder", "CollectionType": "movies", "IsFolder": True}, {"Name": "TV Shows", "ServerId": "stremfin", "Id": "tvshows", "Type": "CollectionFolder", "CollectionType": "tvshows", "IsFolder": True}], "TotalRecordCount": 2, "StartIndex": 0}
 
 

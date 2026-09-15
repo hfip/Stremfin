@@ -10,11 +10,12 @@ class MetadataService:
         results = []
         async with httpx.AsyncClient(timeout=self.settings.request_timeout_seconds, follow_redirects=True) as client:
             for addon in self.settings.addon_urls:
+                base_url = addon.removesuffix("/manifest.json").rstrip("/")
                 try:
-                    response = await client.get(f"{addon.rstrip('/')}/manifest.json"); response.raise_for_status(); manifest = response.json()
+                    response = await client.get(f"{base_url}/manifest.json"); response.raise_for_status(); manifest = response.json()
                 except (httpx.HTTPError, ValueError): continue
                 for catalog in manifest.get("catalogs", []):
-                    results.append({"addon_url": addon.rstrip("/"), "type": catalog.get("type", "movie"), "id": catalog.get("id"), "name": catalog.get("name") or catalog.get("id"), "extra": catalog.get("extra", [])})
+                    results.append({"addon_url": base_url, "type": catalog.get("type", "movie"), "id": catalog.get("id"), "name": catalog.get("name") or catalog.get("id"), "extra": catalog.get("extra", [])})
         return results
 
     async def catalog(self, kind: str, limit: int, selected: list[dict]) -> list[dict]:

@@ -11,10 +11,9 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse, Response
 
 from app.config import Settings, get_settings
-from app.services.debrid import DebridResolver
 from app.services.metadata import MetadataService
+from app.services.playback import PlaybackResolver
 from app.services.settings_store import SettingsStore
-from app.services.stremio import StremioResolver
 from app.services.subtitles import SubtitleResolver
 
 
@@ -27,6 +26,7 @@ MOVIES_VIEW_ID = "movies"
 TVSHOWS_VIEW_ID = "tvshows"
 
 MAX_PAGE_SIZE = 100
+MAX_CATALOG_WINDOW = 500
 DEFAULT_PAGE_SIZE = 20
 
 _EPISODE_ID_RE = re.compile(r"^(?P<series>.+):s(?P<season>\d+)e(?P<episode>\d+)$")
@@ -901,7 +901,7 @@ async def get_items(
     # first page again.
     required_count = min(
         start_index + limit,
-        MAX_PAGE_SIZE,
+        MAX_CATALOG_WINDOW,
     )
 
     metas = await service.catalog(
@@ -1326,10 +1326,185 @@ async def subtitle_stream(
 # ---------------------------------------------------------------------------
 
 
+def _playback_identity(
+    item_id: str,
+) -> tuple[str, int | None, int | None]:
+    """
+    Convert a Jellyfin-facing item id back to the Stremio playback identity.
+
+    Movies use their own id. Episodes use the owning series id plus season /
+    episode numbers. Series and Season entities are intentionally rejected by
+    the PlaybackInfo routes because they are folders, not playable media.
+    """
+
+    episode_parts = _parse_episode_id(item_id)
+
+    if episode_parts:
+        series_id, season_number, episode_number = episode_parts
+        return series_id, season_number, episode_number
+
+    return item_id, None, None
+
+
+async def _validate_playable_item(
+    item_id: str,
+) -> tuple[Any, dict[str, Any], str, int | None, int | None]:
+    runtime, meta = await _lookup(item_id)
+
+    if not meta:
+        raise HTTPException(
+            status_code=404,
+            detail="Item not found in configured addons",
+        )
+
+    entity_type = meta.get("_stremfin_entity")
+
+    if entity_type == "season":
+        raise HTTPException(
+            status_code=400,
+            detail="Season is not a playable media item",
+        )
+
+    if entity_type == "episode":
+        series_meta = meta["_series_meta"]
+        video = meta["_video"]
+
+        series_id = (
+            series_meta.get("imdb_id")
+            or series_meta.get("id")
+        )
+
+        try:
+            season_number = int(video.get("season"))
+            episode_number = int(video.get("episode"))
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=404,
+                detail="Episode playback identity is incomplete",
+            )
+
+        return (
+            runtime,
+            meta,
+            str(series_id),
+            season_number,
+            episode_number,
+        )
+
+    if str(meta.get("type") or "").lower() == "series":
+        raise HTTPException(
+            status_code=400,
+            detail="Series is not a playable media item",
+        )
+
+    content_id = (
+        meta.get("imdb_id")
+        or meta.get("id")
+        or item_id
+    )
+
+    return runtime, meta, str(content_id), None, None
+
+
+async def _playback_response(
+    item_id: str,
+) -> dict[str, Any]:
+    (
+        runtime,
+        _,
+        content_id,
+        season_number,
+        episode_number,
+    ) = await _validate_playable_item(item_id)
+
+    resolver = PlaybackResolver(runtime)
+
+    result = await resolver.playback_info(
+        content_id,
+        season_number,
+        episode_number,
+    )
+
+    media_sources = result.get("MediaSources") or []
+
+    # Subtitle discovery is intentionally deferred until PlaybackInfo instead
+    # of catalog browsing. This keeps VidHub/Infuse navigation fast while still
+    # advertising external subtitle tracks when playback starts.
+    try:
+        subtitle_streams = await _subtitle_streams(
+            runtime,
+            content_id,
+            season_number,
+            episode_number,
+        )
+    except Exception:
+        subtitle_streams = []
+
+    for media_source in media_sources:
+        existing_streams = list(
+            media_source.get("MediaStreams") or []
+        )
+
+        next_index = (
+            max(
+                (
+                    int(stream.get("Index", -1))
+                    for stream in existing_streams
+                    if stream.get("Index") is not None
+                ),
+                default=-1,
+            )
+            + 1
+        )
+
+        for subtitle_number, subtitle in enumerate(subtitle_streams):
+            stream = dict(subtitle)
+            stream["Index"] = next_index + subtitle_number
+            existing_streams.append(stream)
+
+        media_source["MediaStreams"] = existing_streams
+
+    if not media_sources:
+        # Jellyfin-compatible shape: PlaybackInfo itself is a valid response,
+        # but ErrorCode tells the client that no playable source was resolved.
+        result["ErrorCode"] = "NoCompatibleStream"
+
+    return result
+
+
+@router.get("/Items/{item_id}/PlaybackInfo")
+async def playback_info_get(
+    item_id: str,
+):
+    return await _playback_response(item_id)
+
+
+@router.post("/Items/{item_id}/PlaybackInfo")
+async def playback_info_post(
+    item_id: str,
+    request: Request,
+):
+    # Jellyfin clients send DeviceProfile / UserId / MaxStreamingBitrate and
+    # other playback preferences in this body. Stremfin currently exposes only
+    # direct-play sources, so these values do not alter source resolution yet.
+    # Reading the body keeps the route compatible with both empty and standard
+    # Jellyfin POST requests without binding to one client-specific schema.
+    try:
+        await request.json()
+    except Exception:
+        pass
+
+    return await _playback_response(item_id)
+
+
 @router.get("/Videos/{item_id}/stream")
 async def stream(
     item_id: str,
     settings: Settings = Depends(get_settings),
+    media_source_id: str | None = Query(
+        None,
+        alias="MediaSourceId",
+    ),
     user_agent: str | None = Header(
         None,
         alias="User-Agent",
@@ -1340,27 +1515,33 @@ async def stream(
     episode_parts = _parse_episode_id(item_id)
 
     if episode_parts:
-        content, season, episode = episode_parts
+        content_id, season_number, episode_number = episode_parts
     else:
-        content = item_id
-        season = None
-        episode = None
+        # Validate movie ids before resolving. This also prevents Series /
+        # Season folders from accidentally being sent to the Stremio stream
+        # endpoint as if they were movies.
+        (
+            runtime,
+            _,
+            content_id,
+            season_number,
+            episode_number,
+        ) = await _validate_playable_item(item_id)
 
-    candidates = await StremioResolver(runtime).resolve(
-        content,
-        season,
-        episode,
+    resolver = PlaybackResolver(runtime)
+
+    resolved_url = await resolver.first_playable_url(
+        content_id,
+        season_number,
+        episode_number,
+        media_source_id=media_source_id,
     )
 
-    if not candidates:
+    if not resolved_url:
         raise HTTPException(
             status_code=404,
-            detail="No stream found in configured addons",
+            detail="No playable stream found in configured addons",
         )
-
-    resolved_url = await DebridResolver(runtime).resolve(
-        candidates[0].url
-    )
 
     return RedirectResponse(
         resolved_url,

@@ -159,7 +159,7 @@ def _media_source(
 
 
 def _item(meta: dict[str, Any], collection: str) -> dict[str, Any]:
-    item_id = meta.get("imdb_id") or meta.get("id")
+    item_id = meta.get("id") or meta.get("imdb_id")
 
     if not item_id:
         raise ValueError("Metadata item has no stable id")
@@ -413,7 +413,7 @@ def _deduplicate_metas(
     unique: dict[str, dict[str, Any]] = {}
 
     for meta in metas:
-        item_id = meta.get("imdb_id") or meta.get("id")
+        item_id = meta.get("id") or meta.get("imdb_id")
 
         if not item_id:
             continue
@@ -976,8 +976,8 @@ async def get_item(item_id: str):
         season_number = meta["_season_number"]
 
         series_id = (
-            series_meta.get("imdb_id")
-            or series_meta.get("id")
+            series_meta.get("id")
+            or series_meta.get("imdb_id")
         )
 
         return _season_dto(
@@ -991,8 +991,8 @@ async def get_item(item_id: str):
         video = meta["_video"]
 
         series_id = (
-            series_meta.get("imdb_id")
-            or series_meta.get("id")
+            series_meta.get("id")
+            or series_meta.get("imdb_id")
         )
 
         dto = _episode_dto(
@@ -1370,8 +1370,8 @@ async def _validate_playable_item(
         video = meta["_video"]
 
         series_id = (
-            series_meta.get("imdb_id")
-            or series_meta.get("id")
+            series_meta.get("id")
+            or series_meta.get("imdb_id")
         )
 
         try:
@@ -1398,8 +1398,8 @@ async def _validate_playable_item(
         )
 
     content_id = (
-        meta.get("imdb_id")
-        or meta.get("id")
+        meta.get("id")
+        or meta.get("imdb_id")
         or item_id
     )
 

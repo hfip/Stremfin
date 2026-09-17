@@ -481,6 +481,7 @@ async def public_system_info(
 
 
 @router.post("/Users/AuthenticateByName")
+@router.post("/emby/Users/AuthenticateByName")
 async def authenticate(
     request: Request,
     settings: Settings = Depends(get_settings),
@@ -728,6 +729,79 @@ async def _subtitle_streams(
         }
         for index, track in enumerate(tracks)
     ]
+
+
+async def _attach_playback_media(
+    dto: dict[str, Any],
+    runtime,
+    content_id: str,
+    season: int | None = None,
+    episode: int | None = None,
+) -> dict[str, Any]:
+    """
+    Enrich one playable Item DTO with the same real MediaSources advertised by
+    PlaybackInfo.
+
+    This is intentionally used only for individual Movie/Episode detail
+    requests. Catalog browsing remains lightweight and never resolves streams.
+    """
+
+    try:
+        media_sources = await PlaybackResolver(runtime).media_sources(
+            content_id,
+            season,
+            episode,
+        )
+    except Exception:
+        media_sources = []
+
+    try:
+        subtitle_streams = await _subtitle_streams(
+            runtime,
+            content_id,
+            season,
+            episode,
+        )
+    except Exception:
+        subtitle_streams = []
+
+    for media_source in media_sources:
+        existing_streams = list(
+            media_source.get("MediaStreams") or []
+        )
+
+        next_index = (
+            max(
+                (
+                    int(stream.get("Index", -1))
+                    for stream in existing_streams
+                    if stream.get("Index") is not None
+                ),
+                default=-1,
+            )
+            + 1
+        )
+
+        for subtitle_number, subtitle in enumerate(subtitle_streams):
+            stream = dict(subtitle)
+            stream["Index"] = next_index + subtitle_number
+            existing_streams.append(stream)
+
+        media_source["MediaStreams"] = existing_streams
+
+    if media_sources:
+        dto["MediaSources"] = media_sources
+
+        # Jellyfin clients may inspect the top-level MediaStreams before
+        # opening PlaybackInfo. Mirror the first source's streams there.
+        dto["MediaStreams"] = list(
+            media_sources[0].get("MediaStreams") or []
+        )
+    else:
+        # Preserve subtitle discovery even if no playable stream was resolved.
+        dto["MediaStreams"] = subtitle_streams
+
+    return dto
 
 
 # ---------------------------------------------------------------------------
@@ -1020,6 +1094,76 @@ async def latest_items(
 
 
 # ---------------------------------------------------------------------------
+# Library counts
+# ---------------------------------------------------------------------------
+
+
+@router.get("/Items/Counts")
+@router.get("/emby/Items/Counts")
+async def item_counts(
+    user_id: str | None = Query(
+        None,
+        alias="UserId",
+    ),
+):
+    if user_id and user_id != USER_ID:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found",
+        )
+
+    runtime, saved = _runtime(get_settings())
+    service = MetadataService(runtime)
+
+    # Stremio catalogs do not expose a universal Jellyfin-style count
+    # endpoint. Ask the metadata layer for the largest supported deterministic
+    # window and report only counts that Stremfin can establish from real
+    # catalog data. We intentionally do not invent an EpisodeCount.
+    movie_metas = await service.catalog(
+        "movie",
+        MAX_CATALOG_WINDOW,
+        saved.selected_catalogs,
+    )
+    series_metas = await service.catalog(
+        "series",
+        MAX_CATALOG_WINDOW,
+        saved.selected_catalogs,
+    )
+
+    movie_metas = _deduplicate_metas(movie_metas)
+    series_metas = _deduplicate_metas(series_metas)
+
+    movies = [
+        meta
+        for meta in movie_metas
+        if str(meta.get("type") or "").lower() != "series"
+    ]
+    series = [
+        meta
+        for meta in series_metas
+        if str(meta.get("type") or "").lower() == "series"
+    ]
+
+    movie_count = len(movies)
+    series_count = len(series)
+
+    return {
+        "MovieCount": movie_count,
+        "SeriesCount": series_count,
+        "EpisodeCount": 0,
+        "ArtistCount": 0,
+        "ProgramCount": 0,
+        "TrailerCount": 0,
+        "SongCount": 0,
+        "AlbumCount": 0,
+        "MusicVideoCount": 0,
+        "BoxSetCount": 0,
+        "BookCount": 0,
+        "ItemCount": movie_count + series_count,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Individual item
 # ---------------------------------------------------------------------------
 
@@ -1079,17 +1223,16 @@ async def get_item(
         try:
             season_number = int(video.get("season"))
             episode_number = int(video.get("episode"))
-
-            dto["MediaStreams"] = await _subtitle_streams(
-                runtime,
-                series_id,
-                season_number,
-                episode_number,
-            )
         except (TypeError, ValueError):
-            pass
+            return dto
 
-        return dto
+        return await _attach_playback_media(
+            dto,
+            runtime,
+            series_id,
+            season_number,
+            episode_number,
+        )
 
     collection = (
         TVSHOWS_VIEW_ID
@@ -1102,13 +1245,19 @@ async def get_item(
         collection,
     )
 
-    # Resolve subtitles only for an individual playable item.
+    # Resolve real playback versions and subtitles only for an individual
+    # playable item. Catalog browsing remains network-light.
     if dto["Type"] == "Movie":
-        content_id = meta.get("id") or item_id
+        content_id = (
+            meta.get("id")
+            or meta.get("imdb_id")
+            or item_id
+        )
 
-        dto["MediaStreams"] = await _subtitle_streams(
+        return await _attach_playback_media(
+            dto,
             runtime,
-            content_id,
+            str(content_id),
         )
 
     return dto

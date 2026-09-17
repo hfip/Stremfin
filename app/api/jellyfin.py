@@ -955,12 +955,87 @@ async def get_items(
 
 
 # ---------------------------------------------------------------------------
+# Latest items
+# ---------------------------------------------------------------------------
+
+
+@router.get("/Items/Latest")
+@router.get("/Users/{user_id}/Items/Latest")
+async def latest_items(
+    user_id: str | None = None,
+    parent_id: str | None = Query(
+        None,
+        alias="ParentId",
+    ),
+    include_item_types: str | None = Query(
+        None,
+        alias="IncludeItemTypes",
+    ),
+    limit: int = Query(
+        DEFAULT_PAGE_SIZE,
+        alias="Limit",
+        ge=1,
+    ),
+):
+    if user_id and user_id != USER_ID:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found",
+        )
+
+    _, limit = _normalize_page(0, limit)
+
+    runtime, saved = _runtime(get_settings())
+    service = MetadataService(runtime)
+
+    kind, collection = _catalog_kind(
+        parent_id,
+        include_item_types,
+    )
+
+    metas = await service.catalog(
+        kind,
+        limit,
+        saved.selected_catalogs,
+    )
+
+    metas = _deduplicate_metas(metas)
+
+    filtered_metas: list[dict[str, Any]] = []
+
+    for meta in metas:
+        raw_type = str(meta.get("type") or "").lower()
+
+        if kind == "series":
+            if raw_type == "series":
+                filtered_metas.append(meta)
+        else:
+            if raw_type != "series":
+                filtered_metas.append(meta)
+
+    return [
+        _item(meta, collection)
+        for meta in filtered_metas[:limit]
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Individual item
 # ---------------------------------------------------------------------------
 
 
 @router.get("/Items/{item_id}")
-async def get_item(item_id: str):
+@router.get("/Users/{user_id}/Items/{item_id}")
+async def get_item(
+    item_id: str,
+    user_id: str | None = None,
+):
+    if user_id and user_id != USER_ID:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found",
+        )
+
     runtime, meta = await _lookup(item_id)
 
     if not meta:

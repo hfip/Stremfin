@@ -1,64 +1,1037 @@
 """Live Stremio manifest, catalog, and metadata aggregation."""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+from urllib.parse import quote
+
 import httpx
+
 from app.config import Settings
 from app.services.cache import metadata_cache
 
 
 class MetadataService:
-    def __init__(self, settings: Settings): self.settings = settings
+    """
+    Aggregate metadata from configured Stremio addons.
+
+    This service is intentionally Jellyfin-agnostic. Its job is to turn
+    different Stremio addon responses into one predictable canonical shape
+    which the Jellyfin API layer can consume safely.
+
+    Important rules:
+
+    1. Catalog entries are normalized before being returned.
+    2. Duplicate media is removed before pagination/window slicing.
+    3. Catalog requests can walk Stremio `skip` windows when supported.
+    4. A slow/broken addon must not break the complete catalog.
+    5. Metadata lookups are cached per addon/type/item.
+    """
+
+    DEFAULT_CATALOG_PAGE_SIZE = 20
+
+    # Do not let a single Jellyfin browsing request create an unlimited
+    # number of upstream Stremio requests.
+    MAX_CATALOG_PAGES_PER_ADDON = 10
+
+    # Hard upper bound for one aggregated catalog request.
+    MAX_CATALOG_ITEMS = 500
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+
+    # ------------------------------------------------------------------
+    # URL helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _base_url(addon_url: str) -> str:
+        """
+        Convert either:
+
+            https://example.com/manifest.json
+
+        or:
+
+            https://example.com
+
+        into the canonical addon base URL.
+        """
+
+        value = str(addon_url or "").strip()
+
+        if not value:
+            return ""
+
+        return value.removesuffix("/manifest.json").rstrip("/")
+
+    @staticmethod
+    def _safe_segment(value: Any) -> str:
+        """
+        Quote a value for use as one Stremio URL path segment.
+
+        Keep common Stremio/IMDb punctuation readable while preventing
+        malformed catalog URLs.
+        """
+
+        return quote(
+            str(value or ""),
+            safe=":@._~-",
+        )
+
+    # ------------------------------------------------------------------
+    # Manifest discovery
+    # ------------------------------------------------------------------
 
     async def manifests(self) -> list[dict]:
-        key = "manifests:" + "|".join(self.settings.addon_urls)
-        return await metadata_cache.get_or_set(key, self._fetch_manifests)
+        addon_urls = [
+            self._base_url(url)
+            for url in self.settings.addon_urls
+            if self._base_url(url)
+        ]
+
+        key = "manifests:" + "|".join(addon_urls)
+
+        return await metadata_cache.get_or_set(
+            key,
+            self._fetch_manifests,
+        )
 
     async def _fetch_manifests(self) -> list[dict]:
-        results = []
-        async with httpx.AsyncClient(timeout=self.settings.request_timeout_seconds, follow_redirects=True) as client:
-            for addon in self.settings.addon_urls:
-                base_url = addon.removesuffix("/manifest.json").rstrip("/")
-                try:
-                    response = await client.get(f"{base_url}/manifest.json"); response.raise_for_status(); manifest = response.json()
-                except (httpx.HTTPError, ValueError): continue
-                for catalog in manifest.get("catalogs", []):
-                    results.append({"addon_url": base_url, "type": catalog.get("type", "movie"), "id": catalog.get("id"), "name": catalog.get("name") or catalog.get("id"), "extra": catalog.get("extra", [])})
+        addon_urls = [
+            self._base_url(url)
+            for url in self.settings.addon_urls
+            if self._base_url(url)
+        ]
+
+        if not addon_urls:
+            return []
+
+        async with httpx.AsyncClient(
+            timeout=self.settings.request_timeout_seconds,
+            follow_redirects=True,
+        ) as client:
+            tasks = [
+                self._fetch_manifest_from_addon(
+                    client,
+                    base_url,
+                )
+                for base_url in addon_urls
+            ]
+
+            responses = await asyncio.gather(
+                *tasks,
+                return_exceptions=True,
+            )
+
+        results: list[dict] = []
+
+        for response in responses:
+            if isinstance(response, BaseException):
+                continue
+
+            results.extend(response)
+
+        return self._deduplicate_catalog_definitions(results)
+
+    async def _fetch_manifest_from_addon(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+    ) -> list[dict]:
+        try:
+            response = await client.get(
+                f"{base_url}/manifest.json"
+            )
+            response.raise_for_status()
+            manifest = response.json()
+
+        except (
+            httpx.HTTPError,
+            ValueError,
+            TypeError,
+        ):
+            return []
+
+        if not isinstance(manifest, dict):
+            return []
+
+        raw_catalogs = manifest.get("catalogs", [])
+
+        # Some implementations can expose catalog containers in slightly
+        # different shapes. Be conservative and accept only dictionaries.
+        if isinstance(raw_catalogs, dict):
+            raw_catalogs = (
+                raw_catalogs.get("catalogs")
+                or raw_catalogs.get("items")
+                or raw_catalogs.get("metas")
+                or []
+            )
+
+        if not isinstance(raw_catalogs, list):
+            return []
+
+        results: list[dict] = []
+
+        for catalog in raw_catalogs:
+            if not isinstance(catalog, dict):
+                continue
+
+            catalog_id = catalog.get("id")
+
+            if not catalog_id:
+                continue
+
+            catalog_type = self._normalize_stremio_type(
+                catalog.get("type")
+            )
+
+            if catalog_type not in {"movie", "series"}:
+                continue
+
+            extra = catalog.get("extra", [])
+
+            if not isinstance(extra, list):
+                extra = []
+
+            results.append(
+                {
+                    "addon_url": base_url,
+                    "type": catalog_type,
+                    "id": str(catalog_id),
+                    "name": (
+                        catalog.get("name")
+                        or str(catalog_id)
+                    ),
+                    "extra": extra,
+                }
+            )
+
         return results
 
-    async def catalog(self, kind: str, limit: int, selected: list[dict]) -> list[dict]:
-        catalogs = [c for c in selected if c.get("type") == ("series" if kind in ("series", "tv") else "movie")]
-        result = []
+    @staticmethod
+    def _deduplicate_catalog_definitions(
+        catalogs: list[dict],
+    ) -> list[dict]:
+        unique: dict[tuple[str, str, str], dict] = {}
+
         for catalog in catalogs:
-            key = f"catalog:{catalog.get('addon_url')}:{catalog.get('type')}:{catalog.get('id')}"
-            items = await metadata_cache.get_or_set(key, lambda c=catalog: self._fetch_catalog(c))
-            result.extend(items)
-            if len(result) >= limit: break
-        unique = {}; [unique.setdefault(item.get("id"), item) for item in result if item.get("id")]
-        return list(unique.values())[:limit]
+            key = (
+                str(catalog.get("addon_url") or ""),
+                str(catalog.get("type") or ""),
+                str(catalog.get("id") or ""),
+            )
 
-    async def _fetch_catalog(self, catalog: dict) -> list[dict]:
-        async with httpx.AsyncClient(timeout=self.settings.request_timeout_seconds, follow_redirects=True) as client:
+            if not all(key):
+                continue
+
+            if key not in unique:
+                unique[key] = catalog
+
+        return list(unique.values())
+
+    # ------------------------------------------------------------------
+    # Catalog aggregation
+    # ------------------------------------------------------------------
+
+    async def catalog(
+        self,
+        kind: str,
+        limit: int,
+        selected: list[dict],
+    ) -> list[dict]:
+        """
+        Return up to `limit` unique normalized catalog entries.
+
+        The Jellyfin API uses this method to build a sufficiently large
+        stable window and then performs StartIndex/Limit slicing itself.
+
+        Example:
+
+            Jellyfin:
+                StartIndex=40
+                Limit=20
+
+            API layer requests:
+                catalog(..., limit=60)
+
+            This method attempts to collect 60 unique items from the
+            selected Stremio catalogs rather than returning the same
+            first 20 entries repeatedly.
+        """
+
+        endpoint_type = (
+            "series"
+            if kind in ("series", "tv")
+            else "movie"
+        )
+
+        try:
+            requested_limit = int(limit)
+        except (TypeError, ValueError):
+            requested_limit = self.DEFAULT_CATALOG_PAGE_SIZE
+
+        requested_limit = max(
+            1,
+            min(
+                requested_limit,
+                self.MAX_CATALOG_ITEMS,
+            ),
+        )
+
+        catalogs = self._selected_catalogs(
+            selected,
+            endpoint_type,
+        )
+
+        if not catalogs:
+            return []
+
+        unique: dict[str, dict] = {}
+
+        # Process selected catalogs in their configured order.
+        #
+        # This keeps the visible catalog deterministic between sequential
+        # Jellyfin StartIndex requests.
+        for catalog in catalogs:
+            remaining = requested_limit - len(unique)
+
+            if remaining <= 0:
+                break
+
+            items = await self._catalog_window(
+                catalog,
+                requested_limit,
+            )
+
+            for item in items:
+                identity = self._identity(item)
+
+                if not identity:
+                    continue
+
+                if identity not in unique:
+                    unique[identity] = item
+
+                if len(unique) >= requested_limit:
+                    break
+
+        return list(unique.values())[:requested_limit]
+
+    def _selected_catalogs(
+        self,
+        selected: list[dict],
+        endpoint_type: str,
+    ) -> list[dict]:
+        if not isinstance(selected, list):
+            return []
+
+        results: list[dict] = []
+
+        for catalog in selected:
+            if not isinstance(catalog, dict):
+                continue
+
+            catalog_type = self._normalize_stremio_type(
+                catalog.get("type")
+            )
+
+            if catalog_type != endpoint_type:
+                continue
+
+            addon_url = self._base_url(
+                catalog.get("addon_url") or ""
+            )
+
+            catalog_id = catalog.get("id")
+
+            if not addon_url or not catalog_id:
+                continue
+
+            normalized = dict(catalog)
+            normalized["addon_url"] = addon_url
+            normalized["type"] = catalog_type
+            normalized["id"] = str(catalog_id)
+
+            results.append(normalized)
+
+        return self._deduplicate_catalog_definitions(results)
+
+    async def _catalog_window(
+        self,
+        catalog: dict,
+        required_count: int,
+    ) -> list[dict]:
+        """
+        Build one catalog window.
+
+        Stremio addons commonly return around 20 items per catalog request.
+        Addons that support the `skip` extra can expose subsequent pages via:
+
+            /catalog/{type}/{id}/skip=20.json
+            /catalog/{type}/{id}/skip=40.json
+
+        We fetch additional pages only when needed.
+
+        If the addon does not advertise `skip`, the base catalog response
+        is used as-is. This prevents repeatedly requesting unsupported
+        pagination URLs.
+        """
+
+        base_items = await self._cached_catalog_page(
+            catalog,
+            skip=0,
+            use_skip=False,
+        )
+
+        if not base_items:
+            return []
+
+        unique: dict[str, dict] = {}
+
+        self._merge_unique(
+            unique,
+            base_items,
+        )
+
+        if len(unique) >= required_count:
+            return list(unique.values())[:required_count]
+
+        if not self._supports_skip(catalog):
+            return list(unique.values())[:required_count]
+
+        # Use the actual first-page size when possible. This works better
+        # with addons whose natural page size differs from 20.
+        page_size = len(base_items)
+
+        if page_size <= 0:
+            page_size = self.DEFAULT_CATALOG_PAGE_SIZE
+
+        page_size = max(
+            1,
+            min(
+                page_size,
+                100,
+            ),
+        )
+
+        skip = page_size
+        pages_loaded = 1
+
+        while (
+            len(unique) < required_count
+            and pages_loaded < self.MAX_CATALOG_PAGES_PER_ADDON
+        ):
+            page = await self._cached_catalog_page(
+                catalog,
+                skip=skip,
+                use_skip=True,
+            )
+
+            pages_loaded += 1
+
+            if not page:
+                break
+
+            previous_count = len(unique)
+
+            self._merge_unique(
+                unique,
+                page,
+            )
+
+            # If a supposedly paginated addon ignores `skip`, it will
+            # return exactly the same items. Stop immediately instead of
+            # generating a loop of duplicate requests.
+            if len(unique) == previous_count:
+                break
+
+            if len(page) < page_size:
+                # Usually indicates the final page.
+                break
+
+            skip += page_size
+
+        return list(unique.values())[:required_count]
+
+    async def _cached_catalog_page(
+        self,
+        catalog: dict,
+        skip: int,
+        use_skip: bool,
+    ) -> list[dict]:
+        addon_url = self._base_url(
+            catalog.get("addon_url") or ""
+        )
+
+        catalog_type = self._normalize_stremio_type(
+            catalog.get("type")
+        )
+
+        catalog_id = str(
+            catalog.get("id") or ""
+        )
+
+        key = (
+            "catalog:"
+            f"{addon_url}:"
+            f"{catalog_type}:"
+            f"{catalog_id}:"
+            f"skip={skip if use_skip else 'base'}"
+        )
+
+        return await metadata_cache.get_or_set(
+            key,
+            lambda: self._fetch_catalog_page(
+                catalog,
+                skip=skip,
+                use_skip=use_skip,
+            ),
+        )
+
+    async def _fetch_catalog(
+        self,
+        catalog: dict,
+    ) -> list[dict]:
+        """
+        Backward-compatible base catalog loader.
+
+        Kept intentionally because other Stremfin code may still call the
+        old private helper while the Jellyfin layer is being migrated.
+        """
+
+        return await self._fetch_catalog_page(
+            catalog,
+            skip=0,
+            use_skip=False,
+        )
+
+    async def _fetch_catalog_page(
+        self,
+        catalog: dict,
+        skip: int = 0,
+        use_skip: bool = False,
+    ) -> list[dict]:
+        addon_url = self._base_url(
+            catalog.get("addon_url") or ""
+        )
+
+        catalog_type = self._normalize_stremio_type(
+            catalog.get("type")
+        )
+
+        catalog_id = str(
+            catalog.get("id") or ""
+        )
+
+        if (
+            not addon_url
+            or not catalog_type
+            or not catalog_id
+        ):
+            return []
+
+        type_segment = self._safe_segment(catalog_type)
+        id_segment = self._safe_segment(catalog_id)
+
+        if use_skip and skip > 0:
+            url = (
+                f"{addon_url}/catalog/"
+                f"{type_segment}/"
+                f"{id_segment}/"
+                f"skip={int(skip)}.json"
+            )
+        else:
+            url = (
+                f"{addon_url}/catalog/"
+                f"{type_segment}/"
+                f"{id_segment}.json"
+            )
+
+        async with httpx.AsyncClient(
+            timeout=self.settings.request_timeout_seconds,
+            follow_redirects=True,
+        ) as client:
             try:
-                response = await client.get(f"{catalog['addon_url'].removesuffix('/manifest.json').rstrip('/')}/catalog/{catalog['type']}/{catalog['id']}.json"); response.raise_for_status(); payload = response.json()
-            except (httpx.HTTPError, ValueError, KeyError): return []
-        return [self._normalize(item, catalog["type"]) for item in payload.get("metas", [])]
+                response = await client.get(url)
 
-    async def details(self, item_id: str, kind: str, addon_urls: list[str]) -> dict | None:
-        endpoint_type = "series" if kind in ("series", "tv") else "movie"
+                # Pagination support differs between addons. A missing
+                # secondary page is not an application error.
+                if response.status_code == 404:
+                    return []
+
+                response.raise_for_status()
+                payload = response.json()
+
+            except (
+                httpx.HTTPError,
+                ValueError,
+                TypeError,
+            ):
+                return []
+
+        raw_items = self._extract_catalog_items(payload)
+
+        normalized: list[dict] = []
+
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+
+            value = self._normalize(
+                item,
+                catalog_type,
+            )
+
+            if not value.get("id"):
+                continue
+
+            normalized.append(value)
+
+        return self._deduplicate_items(normalized)
+
+    @staticmethod
+    def _extract_catalog_items(
+        payload: Any,
+    ) -> list[dict]:
+        """
+        Handle common Stremio catalog response shapes.
+
+        Standard:
+            {"metas": [...]}
+
+        Also tolerate:
+            {"items": [...]}
+            {"results": [...]}
+            {"catalog": [...]}
+            [...]
+
+        This makes catalog discovery less fragile when third-party addons
+        deviate slightly from the standard response envelope.
+        """
+
+        if isinstance(payload, list):
+            return [
+                item
+                for item in payload
+                if isinstance(item, dict)
+            ]
+
+        if not isinstance(payload, dict):
+            return []
+
+        for key in (
+            "metas",
+            "items",
+            "results",
+            "catalog",
+        ):
+            value = payload.get(key)
+
+            if isinstance(value, list):
+                return [
+                    item
+                    for item in value
+                    if isinstance(item, dict)
+                ]
+
+            if isinstance(value, dict):
+                for nested_key in (
+                    "metas",
+                    "items",
+                    "results",
+                ):
+                    nested = value.get(nested_key)
+
+                    if isinstance(nested, list):
+                        return [
+                            item
+                            for item in nested
+                            if isinstance(item, dict)
+                        ]
+
+        return []
+
+    @staticmethod
+    def _supports_skip(
+        catalog: dict,
+    ) -> bool:
+        extra = catalog.get("extra", [])
+
+        if not isinstance(extra, list):
+            return False
+
+        for entry in extra:
+            if isinstance(entry, str):
+                if entry.strip().lower() == "skip":
+                    return True
+
+                continue
+
+            if not isinstance(entry, dict):
+                continue
+
+            name = str(
+                entry.get("name")
+                or entry.get("id")
+                or ""
+            ).strip().lower()
+
+            if name == "skip":
+                return True
+
+        return False
+
+    # ------------------------------------------------------------------
+    # Metadata details
+    # ------------------------------------------------------------------
+
+    async def details(
+        self,
+        item_id: str,
+        kind: str,
+        addon_urls: list[str],
+    ) -> dict | None:
+        endpoint_type = (
+            "series"
+            if kind in ("series", "tv")
+            else "movie"
+        )
+
+        item_id = str(item_id or "").strip()
+
+        if not item_id:
+            return None
+
+        clean_addons: list[str] = []
+
         for addon in addon_urls:
-            base_url = addon.removesuffix("/manifest.json").rstrip("/")
-            key = f"meta:{base_url}:{endpoint_type}:{item_id}"
-            result = await metadata_cache.get_or_set(key, lambda b=base_url: self._fetch_details(b, endpoint_type, item_id))
-            if result: return result
+            base_url = self._base_url(addon)
+
+            if (
+                base_url
+                and base_url not in clean_addons
+            ):
+                clean_addons.append(base_url)
+
+        # Preserve configured addon priority. Metadata for the same title
+        # can differ between providers, and changing order between requests
+        # can cause unstable Jellyfin objects.
+        for base_url in clean_addons:
+            key = (
+                "meta:"
+                f"{base_url}:"
+                f"{endpoint_type}:"
+                f"{item_id}"
+            )
+
+            result = await metadata_cache.get_or_set(
+                key,
+                lambda b=base_url: self._fetch_details(
+                    b,
+                    endpoint_type,
+                    item_id,
+                ),
+            )
+
+            if result:
+                return result
+
         return None
 
-    async def _fetch_details(self, base_url: str, endpoint_type: str, item_id: str) -> dict | None:
-        async with httpx.AsyncClient(timeout=self.settings.request_timeout_seconds, follow_redirects=True) as client:
-            try:
-                response = await client.get(f"{base_url}/meta/{endpoint_type}/{item_id}.json")
-                if response.status_code == 404: return None
-                response.raise_for_status(); item = response.json().get("meta") or {}
-            except (httpx.HTTPError, ValueError): return None
-        return self._normalize(item, endpoint_type) if item else None
+    async def _fetch_details(
+        self,
+        base_url: str,
+        endpoint_type: str,
+        item_id: str,
+    ) -> dict | None:
+        type_segment = self._safe_segment(
+            endpoint_type
+        )
 
-    def _normalize(self, item: dict, kind: str) -> dict:
-        date = item.get("releaseInfo") or item.get("year") or ""
-        return {"id": item.get("id"), "imdb_id": item.get("imdb_id") or (item.get("id") if str(item.get("id", "")).startswith("tt") else None), "name": item.get("name") or item.get("title"), "type": "Series" if kind in ("series", "tv") else "Movie", "overview": item.get("description") or item.get("overview") or "", "year": int(str(date)[:4]) if str(date)[:4].isdigit() else None, "poster": item.get("poster"), "backdrop": item.get("background") or item.get("backdrop"), "runtime": item.get("runtime"), "videos": item.get("videos", []), "raw": item}
+        item_segment = self._safe_segment(
+            item_id
+        )
+
+        url = (
+            f"{base_url}/meta/"
+            f"{type_segment}/"
+            f"{item_segment}.json"
+        )
+
+        async with httpx.AsyncClient(
+            timeout=self.settings.request_timeout_seconds,
+            follow_redirects=True,
+        ) as client:
+            try:
+                response = await client.get(url)
+
+                if response.status_code == 404:
+                    return None
+
+                response.raise_for_status()
+                payload = response.json()
+
+            except (
+                httpx.HTTPError,
+                ValueError,
+                TypeError,
+            ):
+                return None
+
+        item = self._extract_meta(payload)
+
+        if not item:
+            return None
+
+        return self._normalize(
+            item,
+            endpoint_type,
+        )
+
+    @staticmethod
+    def _extract_meta(
+        payload: Any,
+    ) -> dict | None:
+        if not isinstance(payload, dict):
+            return None
+
+        meta = payload.get("meta")
+
+        if isinstance(meta, dict):
+            return meta
+
+        # Tolerate addons which return the metadata object directly.
+        if (
+            payload.get("id")
+            and (
+                payload.get("name")
+                or payload.get("title")
+            )
+        ):
+            return payload
+
+        item = payload.get("item")
+
+        if isinstance(item, dict):
+            return item
+
+        result = payload.get("result")
+
+        if isinstance(result, dict):
+            return result
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Normalization
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_stremio_type(
+        value: Any,
+    ) -> str:
+        raw = str(value or "").strip().lower()
+
+        if raw in {
+            "series",
+            "tv",
+            "show",
+            "shows",
+            "tvshow",
+            "tvshows",
+        }:
+            return "series"
+
+        if raw in {
+            "movie",
+            "movies",
+            "film",
+            "films",
+        }:
+            return "movie"
+
+        return raw
+
+    def _normalize(
+        self,
+        item: dict,
+        kind: str,
+    ) -> dict:
+        endpoint_type = self._normalize_stremio_type(
+            kind
+        )
+
+        raw_id = item.get("id")
+
+        imdb_id = (
+            item.get("imdb_id")
+            or item.get("imdbId")
+            or self._provider_imdb_id(item)
+        )
+
+        if (
+            not imdb_id
+            and str(raw_id or "").startswith("tt")
+        ):
+            imdb_id = str(raw_id)
+
+        date = (
+            item.get("releaseInfo")
+            or item.get("year")
+            or item.get("released")
+            or ""
+        )
+
+        videos = item.get("videos", [])
+
+        if not isinstance(videos, list):
+            videos = []
+
+        poster = (
+            item.get("poster")
+            or item.get("posterUrl")
+            or item.get("image")
+        )
+
+        backdrop = (
+            item.get("background")
+            or item.get("backdrop")
+            or item.get("fanart")
+        )
+
+        return {
+            "id": raw_id,
+            "imdb_id": imdb_id,
+            "name": (
+                item.get("name")
+                or item.get("title")
+                or str(raw_id or "")
+            ),
+            "type": (
+                "Series"
+                if endpoint_type == "series"
+                else "Movie"
+            ),
+            "overview": (
+                item.get("description")
+                or item.get("overview")
+                or ""
+            ),
+            "year": self._extract_year(date),
+            "poster": poster,
+            "backdrop": backdrop,
+            "runtime": item.get("runtime"),
+            "videos": videos,
+            "raw": item,
+        }
+
+    @staticmethod
+    def _provider_imdb_id(
+        item: dict,
+    ) -> str | None:
+        provider_ids = (
+            item.get("providerIds")
+            or item.get("provider_ids")
+            or {}
+        )
+
+        if not isinstance(provider_ids, dict):
+            return None
+
+        value = (
+            provider_ids.get("imdb")
+            or provider_ids.get("Imdb")
+            or provider_ids.get("IMDB")
+        )
+
+        if value:
+            return str(value)
+
+        return None
+
+    @staticmethod
+    def _extract_year(
+        value: Any,
+    ) -> int | None:
+        text = str(value or "").strip()
+
+        if not text:
+            return None
+
+        # Common values:
+        #
+        # 2024
+        # "2024"
+        # "2024-05-01"
+        # "2024–2025"
+        #
+        # Prefer the first four characters when they form a plausible year.
+        first_four = text[:4]
+
+        if first_four.isdigit():
+            year = int(first_four)
+
+            if 1800 <= year <= 3000:
+                return year
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Deduplication
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _identity(
+        item: dict,
+    ) -> str | None:
+        """
+        Stable identity used when merging multiple Stremio catalogs.
+
+        Prefer IMDb because two addons can expose the same title using
+        slightly different internal IDs. Fall back to the native Stremio ID.
+        """
+
+        imdb_id = item.get("imdb_id")
+
+        if imdb_id:
+            return f"imdb:{imdb_id}"
+
+        item_id = item.get("id")
+
+        if item_id:
+            return f"id:{item_id}"
+
+        return None
+
+    def _deduplicate_items(
+        self,
+        items: list[dict],
+    ) -> list[dict]:
+        unique: dict[str, dict] = {}
+
+        for item in items:
+            identity = self._identity(item)
+
+            if not identity:
+                continue
+
+            if identity not in unique:
+                unique[identity] = item
+
+        return list(unique.values())
+
+    def _merge_unique(
+        self,
+        destination: dict[str, dict],
+        items: list[dict],
+    ) -> None:
+        for item in items:
+            identity = self._identity(item)
+
+            if not identity:
+                continue
+
+            if identity not in destination:
+                destination[identity] = item

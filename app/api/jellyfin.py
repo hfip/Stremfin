@@ -551,35 +551,44 @@ async def get_user(user_id: str):
     }
 
 
+def _collection_folder(item_id: str) -> dict[str, Any]:
+    if item_id == MOVIES_VIEW_ID:
+        name = "Movies"
+        collection_type = "movies"
+    elif item_id == TVSHOWS_VIEW_ID:
+        name = "TV Shows"
+        collection_type = "tvshows"
+    else:
+        raise ValueError("Unknown collection folder")
+
+    return {
+        "Name": name,
+        "OriginalTitle": name,
+        "ServerId": "stremfin",
+        "Id": item_id,
+        "Etag": f"{item_id}-stremfin",
+        "Type": "CollectionFolder",
+        "CollectionType": collection_type,
+        "IsFolder": True,
+        "MediaType": "Unknown",
+        "LocationType": "Virtual",
+        "Path": item_id,
+        "ImageTags": {},
+        "BackdropImageTags": [],
+        "ProviderIds": {},
+        "UserData": _userdata(),
+        "CanDelete": False,
+        "CanDownload": False,
+        "PlayAccess": "Full",
+        "ChildCount": 0,
+    }
+
+
 def _views():
     return {
         "Items": [
-            {
-                "Name": "Movies",
-                "ServerId": "stremfin",
-                "Id": MOVIES_VIEW_ID,
-                "Type": "CollectionFolder",
-                "CollectionType": "movies",
-                "IsFolder": True,
-                "MediaType": "Unknown",
-                "LocationType": "Virtual",
-                "ImageTags": {},
-                "BackdropImageTags": [],
-                "UserData": _userdata(),
-            },
-            {
-                "Name": "TV Shows",
-                "ServerId": "stremfin",
-                "Id": TVSHOWS_VIEW_ID,
-                "Type": "CollectionFolder",
-                "CollectionType": "tvshows",
-                "IsFolder": True,
-                "MediaType": "Unknown",
-                "LocationType": "Virtual",
-                "ImageTags": {},
-                "BackdropImageTags": [],
-                "UserData": _userdata(),
-            },
+            _collection_folder(MOVIES_VIEW_ID),
+            _collection_folder(TVSHOWS_VIEW_ID),
         ],
         "TotalRecordCount": 2,
         "StartIndex": 0,
@@ -1209,6 +1218,47 @@ async def get_items(
 
 
 # ---------------------------------------------------------------------------
+# Resume / Next Up compatibility
+# ---------------------------------------------------------------------------
+
+
+@router.get("/emby/Users/{user_id}/Items/Resume")
+@router.get("/Users/{user_id}/Items/Resume")
+async def resume_items(
+    user_id: str,
+    start_index: int = Query(0, alias="StartIndex", ge=0),
+    limit: int = Query(DEFAULT_PAGE_SIZE, alias="Limit", ge=1),
+):
+    if user_id != USER_ID:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    start_index, _ = _normalize_page(start_index, limit)
+    return {
+        "Items": [],
+        "TotalRecordCount": 0,
+        "StartIndex": start_index,
+    }
+
+
+@router.get("/emby/Shows/NextUp")
+@router.get("/Shows/NextUp")
+async def next_up(
+    user_id: str | None = Query(None, alias="UserId"),
+    start_index: int = Query(0, alias="StartIndex", ge=0),
+    limit: int = Query(DEFAULT_PAGE_SIZE, alias="Limit", ge=1),
+):
+    if user_id and user_id != USER_ID:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    start_index, _ = _normalize_page(start_index, limit)
+    return {
+        "Items": [],
+        "TotalRecordCount": 0,
+        "StartIndex": start_index,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Latest items
 # ---------------------------------------------------------------------------
 
@@ -1363,6 +1413,9 @@ async def get_item(
             status_code=404,
             detail="User not found",
         )
+
+    if item_id in {MOVIES_VIEW_ID, TVSHOWS_VIEW_ID}:
+        return _collection_folder(item_id)
 
     runtime, meta = await _lookup(item_id)
 

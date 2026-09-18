@@ -145,15 +145,46 @@ class MetadataService:
         limit: int,
         selected: list[dict],
     ) -> list[dict]:
-        """Backward-compatible catalog window backed by the full snapshot."""
+        """
+        Return a small, fast foreground catalog window.
+
+        The request path intentionally does not build a complete catalog
+        snapshot. This keeps Jellyfin/Emby clients responsive.
+        """
+        endpoint_type = "series" if kind in ("series", "tv") else "movie"
+
         try:
             requested_limit = int(limit)
         except (TypeError, ValueError):
             requested_limit = self.DEFAULT_CATALOG_PAGE_SIZE
 
-        requested_limit = max(1, min(requested_limit, self.MAX_CATALOG_ITEMS))
-        snapshot = await self._catalog_snapshot(kind, selected)
-        return snapshot[:requested_limit]
+        requested_limit = max(1, min(requested_limit, 100))
+        catalogs = self._selected_catalogs(selected, endpoint_type)
+        if not catalogs:
+            return []
+
+        # Fetch only each selected catalog's base page, concurrently.
+        responses = await asyncio.gather(
+            *(
+                self._cached_catalog_page(
+                    catalog,
+                    skip=0,
+                    use_skip=False,
+                )
+                for catalog in catalogs
+            ),
+            return_exceptions=True,
+        )
+
+        unique: dict[str, dict] = {}
+        for response in responses:
+            if isinstance(response, BaseException):
+                continue
+            self._merge_unique(unique, response)
+            if len(unique) >= requested_limit:
+                break
+
+        return list(unique.values())[:requested_limit]
 
     async def catalog_page(
         self,
@@ -163,7 +194,12 @@ class MetadataService:
         selected: list[dict],
     ) -> dict:
         """
-        Return an exact page and exact TotalRecordCount from one stable snapshot.
+        Fast foreground page for Jellyfin/Emby clients.
+
+        Advanced full-catalog pagination is deliberately deferred to the
+        future background-cache stage. TotalRecordCount therefore describes
+        the currently available foreground window and never triggers a costly
+        synchronous crawl.
         """
         try:
             start = max(0, int(start_index))
@@ -175,108 +211,27 @@ class MetadataService:
         except (TypeError, ValueError):
             page_limit = self.DEFAULT_CATALOG_PAGE_SIZE
 
-        page_limit = min(page_limit, 500)
-        snapshot = await self._catalog_snapshot(kind, selected)
-        total = len(snapshot)
+        page_limit = min(page_limit, 100)
+
+        # The stable foreground window is intentionally capped at 100.
+        foreground_limit = min(max(start + page_limit, page_limit), 100)
+        items = await self.catalog(
+            kind=kind,
+            limit=foreground_limit,
+            selected=selected,
+        )
+
+        total = len(items)
         end = min(start + page_limit, total)
 
         return {
-            "items": snapshot[start:end],
+            "items": items[start:end],
             "start_index": start,
             "limit": page_limit,
             "has_more": end < total,
             "total_record_count": total,
-            "is_total_exact": True,
+            "is_total_exact": False,
         }
-
-    async def _catalog_snapshot(
-        self,
-        kind: str,
-        selected: list[dict],
-    ) -> list[dict]:
-        endpoint_type = "series" if kind in ("series", "tv") else "movie"
-        catalogs = self._selected_catalogs(selected, endpoint_type)
-        if not catalogs:
-            return []
-
-        signature = "|".join(
-            f"{catalog.get('addon_url')}::{catalog.get('type')}::{catalog.get('id')}"
-            for catalog in catalogs
-        )
-        key = f"catalog-snapshot:v2:{endpoint_type}:{signature}"
-
-        return await metadata_cache.get_or_set(
-            key,
-            lambda: self._build_catalog_snapshot(catalogs),
-        )
-
-    async def _build_catalog_snapshot(
-        self,
-        catalogs: list[dict],
-    ) -> list[dict]:
-        # Fetch independent selected catalogs concurrently. Their final merge
-        # still follows configured order because gather preserves task order.
-        responses = await asyncio.gather(
-            *(self._complete_catalog(catalog) for catalog in catalogs),
-            return_exceptions=True,
-        )
-
-        unique: dict[str, dict] = {}
-        for response in responses:
-            if isinstance(response, BaseException):
-                continue
-            self._merge_unique(unique, response)
-            if len(unique) >= self.MAX_CATALOG_ITEMS:
-                break
-
-        return list(unique.values())[: self.MAX_CATALOG_ITEMS]
-
-    async def _complete_catalog(self, catalog: dict) -> list[dict]:
-        base_items = await self._cached_catalog_page(
-            catalog,
-            skip=0,
-            use_skip=False,
-        )
-        if not base_items:
-            return []
-
-        unique: dict[str, dict] = {}
-        self._merge_unique(unique, base_items)
-
-        if not self._supports_skip(catalog):
-            return list(unique.values())
-
-        page_size = max(1, min(len(base_items), 100))
-        skip = page_size
-        pages_loaded = 1
-
-        while (
-            pages_loaded < self.MAX_CATALOG_PAGES_PER_ADDON
-            and len(unique) < self.MAX_CATALOG_ITEMS
-        ):
-            page = await self._cached_catalog_page(
-                catalog,
-                skip=skip,
-                use_skip=True,
-            )
-            pages_loaded += 1
-
-            if not page:
-                break
-
-            previous_count = len(unique)
-            self._merge_unique(unique, page)
-
-            # Protect against addons that advertise skip but ignore it.
-            if len(unique) == previous_count:
-                break
-
-            if len(page) < page_size:
-                break
-
-            skip += page_size
-
-        return list(unique.values())[: self.MAX_CATALOG_ITEMS]
 
     def _selected_catalogs(
         self,
@@ -310,9 +265,18 @@ class MetadataService:
         catalog: dict,
         required_count: int,
     ) -> list[dict]:
-        """Compatibility helper retained for existing callers/tests."""
-        items = await self._complete_catalog(catalog)
-        return items[: max(1, int(required_count))]
+        """Fast compatibility helper: base page only, never a full crawl."""
+        try:
+            requested = max(1, min(int(required_count), 100))
+        except (TypeError, ValueError):
+            requested = self.DEFAULT_CATALOG_PAGE_SIZE
+
+        items = await self._cached_catalog_page(
+            catalog,
+            skip=0,
+            use_skip=False,
+        )
+        return items[:requested]
 
     async def _cached_catalog_page(
         self,

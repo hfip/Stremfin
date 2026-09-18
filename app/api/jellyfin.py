@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Any
 from uuid import uuid4
@@ -188,6 +189,69 @@ def _display_name(meta: dict[str, Any]) -> str:
     return str(meta.get("id") or meta.get("imdb_id") or "Unknown")
 
 
+def _provider_ids(meta: dict[str, Any]) -> dict[str, str]:
+    raw = meta.get("raw")
+    if not isinstance(raw, dict):
+        raw = {}
+
+    raw_provider_ids = (
+        raw.get("providerIds")
+        or raw.get("provider_ids")
+        or {}
+    )
+    if not isinstance(raw_provider_ids, dict):
+        raw_provider_ids = {}
+
+    def pick(*keys: str) -> str | None:
+        for key in keys:
+            value = raw_provider_ids.get(key)
+            if value not in (None, ""):
+                return str(value)
+
+        for key in keys:
+            value = raw.get(key)
+            if value not in (None, ""):
+                return str(value)
+
+        for key in keys:
+            value = meta.get(key)
+            if value not in (None, ""):
+                return str(value)
+
+        return None
+
+    imdb = pick("Imdb", "IMDb", "IMDB", "imdb", "imdb_id", "imdbId")
+    tmdb = pick("Tmdb", "TMDB", "tmdb", "tmdb_id", "tmdbId")
+    tvdb = pick("Tvdb", "TVDB", "tvdb", "tvdb_id", "tvdbId")
+
+    result: dict[str, str] = {}
+
+    if imdb:
+        result["Imdb"] = imdb
+    if tmdb:
+        result["Tmdb"] = tmdb
+    if tvdb:
+        result["Tvdb"] = tvdb
+
+    return result
+
+
+def _logo_url(meta: dict[str, Any]) -> str | None:
+    raw = meta.get("raw")
+    if not isinstance(raw, dict):
+        raw = {}
+
+    value = (
+        meta.get("logo")
+        or raw.get("logo")
+        or raw.get("clearLogo")
+        or raw.get("clearlogo")
+        or raw.get("clear_logo")
+    )
+
+    return str(value).strip() if value else None
+
+
 def _item(meta: dict[str, Any], collection: str) -> dict[str, Any]:
     item_id = meta.get("id") or meta.get("imdb_id")
 
@@ -224,11 +288,7 @@ def _item(meta: dict[str, Any], collection: str) -> dict[str, Any]:
         "PlayAccess": "Full",
         "EnableMediaSourceDisplay": not is_series,
         "UserData": _userdata(),
-        "ProviderIds": (
-            {"Imdb": meta.get("imdb_id")}
-            if meta.get("imdb_id")
-            else {}
-        ),
+        "ProviderIds": _provider_ids(meta),
         "MediaStreams": [],
         "MediaSources": (
             []
@@ -252,6 +312,22 @@ def _item(meta: dict[str, Any], collection: str) -> dict[str, Any]:
                 ],
             }
         )
+
+    logo_url = _logo_url(meta)
+
+    if logo_url:
+        image_tags = dict(dto.get("ImageTags") or {})
+        image_tags["Logo"] = "live"
+        dto["ImageTags"] = image_tags
+
+        image_sources = list(dto.get("ImageSources") or [])
+        image_sources.append(
+            {
+                "Type": "Logo",
+                "Url": f"/Items/{item_id}/Images/Logo",
+            }
+        )
+        dto["ImageSources"] = image_sources
 
     if meta.get("backdrop"):
         dto.update(
@@ -1184,11 +1260,14 @@ async def get_items(
         ordered_seasons = sorted(season_numbers)
 
         seasons = [
-            _season_dto(
-                parent_id,
-                meta.get("name"),
-                number,
-            )
+            {
+                **_season_dto(
+                    parent_id,
+                    meta.get("name"),
+                    number,
+                ),
+                "ProviderIds": _provider_ids(meta),
+            }
             for number in ordered_seasons
         ]
 
@@ -1231,6 +1310,45 @@ async def get_items(
     )
 
     metas = _deduplicate_metas(metas)
+
+    # Some Stremio movie catalogs expose a generic preview name such as
+    # "stream" even though their /meta/movie/{id}.json endpoint contains the
+    # real title. Enrich only those malformed/generic movie entries, and do it
+    # concurrently so normal catalog browsing remains fast.
+    if kind == "movie":
+        generic_names = {
+            "",
+            "stream",
+            "stremio stream",
+            "video",
+            "movie",
+        }
+
+        async def enrich_movie(meta: dict[str, Any]) -> dict[str, Any]:
+            if _display_name(meta).strip().lower() not in generic_names:
+                return meta
+
+            lookup_id = meta.get("id") or meta.get("imdb_id")
+            if not lookup_id:
+                return meta
+
+            try:
+                detailed = await service.details(
+                    str(lookup_id),
+                    "movie",
+                    runtime.addon_urls,
+                )
+            except Exception:
+                detailed = None
+
+            return detailed or meta
+
+        metas = list(
+            await asyncio.gather(
+                *(enrich_movie(meta) for meta in metas)
+            )
+        )
+        metas = _deduplicate_metas(metas)
 
     # Strictly isolate Movies and Series even when an upstream addon
     # returns mixed metadata.
@@ -1477,6 +1595,40 @@ async def local_trailers(
 
 
 # ---------------------------------------------------------------------------
+# Optional media extras compatibility
+# ---------------------------------------------------------------------------
+
+
+@router.get("/emby/Users/{user_id}/Items/{item_id}/SpecialFeatures")
+@router.get("/Users/{user_id}/Items/{item_id}/SpecialFeatures")
+async def special_features(
+    user_id: str,
+    item_id: str,
+):
+    if user_id != USER_ID:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found",
+        )
+
+    return {
+        "Items": [],
+        "TotalRecordCount": 0,
+    }
+
+
+@router.get("/emby/MediaSegments/{item_id}")
+@router.get("/MediaSegments/{item_id}")
+async def media_segments(item_id: str):
+    # Stremfin currently has no intro/credits/chapter segment database.
+    # Return the empty Jellyfin-compatible envelope instead of 404.
+    return {
+        "Items": [],
+        "TotalRecordCount": 0,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Individual item
 # ---------------------------------------------------------------------------
 
@@ -1517,11 +1669,13 @@ async def get_item(
             or series_meta.get("imdb_id")
         )
 
-        return _season_dto(
+        dto = _season_dto(
             series_id,
             series_meta.get("name"),
             season_number,
         )
+        dto["ProviderIds"] = _provider_ids(series_meta)
+        return dto
 
     if entity_type == "episode":
         series_meta = meta["_series_meta"]
@@ -1537,6 +1691,16 @@ async def get_item(
             series_meta.get("name"),
             video,
         )
+
+        # Episode matching benefits from the parent series provider IDs.
+        # Overlay any episode-specific IDs returned by the Stremio video.
+        episode_meta = {
+            "raw": video,
+            "imdb_id": video.get("imdb_id") or video.get("imdbId"),
+        }
+        provider_ids = _provider_ids(series_meta)
+        provider_ids.update(_provider_ids(episode_meta))
+        dto["ProviderIds"] = provider_ids
 
         try:
             season_number = int(video.get("season"))
@@ -1770,6 +1934,38 @@ async def primary_image(item_id: str):
         raise HTTPException(
             status_code=404,
             detail="Image not found in configured addons",
+        )
+
+    return RedirectResponse(
+        image_url,
+        status_code=302,
+    )
+
+
+@router.get("/emby/Items/{item_id}/Images/Logo")
+@router.get("/Items/{item_id}/Images/Logo")
+async def logo_image(item_id: str):
+    _, meta = await _lookup(item_id)
+
+    if not meta:
+        raise HTTPException(
+            status_code=404,
+            detail="Logo not found in configured addons",
+        )
+
+    entity_type = meta.get("_stremfin_entity")
+
+    if entity_type in {"season", "episode"}:
+        source_meta = meta["_series_meta"]
+    else:
+        source_meta = meta
+
+    image_url = _logo_url(source_meta)
+
+    if not image_url:
+        raise HTTPException(
+            status_code=404,
+            detail="Logo not found in configured addons",
         )
 
     return RedirectResponse(

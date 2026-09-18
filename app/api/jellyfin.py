@@ -1487,24 +1487,30 @@ async def get_items(
         include_item_types,
     )
 
-    # MetadataService currently accepts a requested item count rather
-    # than an offset. Fetch enough data to cover the requested Jellyfin
-    # window and perform the final slicing here.
+    # Use MetadataService's progressive page probe instead of treating the
+    # currently loaded window as the complete library. Infuse requests pages
+    # such as StartIndex=0/50/100 and relies on TotalRecordCount to decide
+    # whether another request is necessary.
     #
-    # This fixes the old behaviour where every StartIndex returned the
-    # first page again.
-    required_count = min(
-        start_index + limit,
-        MAX_CATALOG_WINDOW,
+    # catalog_page() probes one item beyond the requested window. While more
+    # data exists it reports a monotonic lower-bound total; on the final page
+    # the total becomes exact. This avoids downloading the whole Stremio
+    # catalog on the first Infuse request.
+    catalog_result = await service.catalog_page(
+        kind=kind,
+        start_index=start_index,
+        limit=limit,
+        selected=saved.selected_catalogs,
     )
 
-    metas = await service.catalog(
-        kind,
-        required_count,
-        saved.selected_catalogs,
+    metas = _deduplicate_metas(
+        list(catalog_result.get("items") or [])
     )
 
-    metas = _deduplicate_metas(metas)
+    catalog_total = int(
+        catalog_result.get("total_record_count")
+        or (start_index + len(metas))
+    )
 
     # Some Stremio movie catalogs expose a generic preview name such as
     # "stream" even though their /meta/movie/{id}.json endpoint contains the
@@ -1607,10 +1613,16 @@ async def get_items(
         for meta in filtered_metas
     ]
 
-    page = _paginate(
-        items,
-        start_index,
-        limit,
+    # `catalog_page()` already applied StartIndex/Limit. Do not paginate this
+    # list a second time or StartIndex=50 would incorrectly slice an already
+    # sliced 50-item page down to an empty list.
+    page = items
+
+    # Keep the advertised total consistent even if an upstream addon returned
+    # an unexpected mixed-type entry that was filtered locally.
+    catalog_total = max(
+        catalog_total,
+        start_index + len(page),
     )
 
     # IMPORTANT:
@@ -1625,7 +1637,7 @@ async def get_items(
 
     return {
         "Items": page,
-        "TotalRecordCount": len(items),
+        "TotalRecordCount": catalog_total,
         "StartIndex": start_index,
     }
 
@@ -2194,6 +2206,9 @@ async def primary_image(item_id: str):
     return RedirectResponse(
         image_url,
         status_code=302,
+        headers={
+            "Cache-Control": "public, max-age=86400",
+        },
     )
 
 
@@ -2226,6 +2241,9 @@ async def logo_image(item_id: str):
     return RedirectResponse(
         image_url,
         status_code=302,
+        headers={
+            "Cache-Control": "public, max-age=86400",
+        },
     )
 
 
@@ -2257,6 +2275,9 @@ async def backdrop_image(item_id: str):
     return RedirectResponse(
         image_url,
         status_code=302,
+        headers={
+            "Cache-Control": "public, max-age=86400",
+        },
     )
 
 

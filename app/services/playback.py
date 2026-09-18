@@ -182,7 +182,56 @@ class PlaybackResolver:
                 )
             )
 
+        # Keep the final MediaSources order deterministic across clients.
+        # Quality is the primary key; configured addon order is the secondary
+        # key. Concurrency affects latency only, never the visible ordering.
+        results.sort(key=self._resolved_source_sort_key)
         return results
+
+    def _resolved_source_sort_key(
+        self,
+        source: ResolvedMediaSource,
+    ) -> tuple[int, int, int, str, str]:
+        quality_rank = {
+            "4K": 0,
+            "1440p": 1,
+            "1080p": 2,
+            "720p": 3,
+            "576p": 4,
+            "480p": 5,
+            "360p": 6,
+        }.get(str(source.quality or ""), 7)
+
+        addon_order = {
+            self._normalized_addon_url(url): index
+            for index, url in enumerate(self._addon_urls())
+        }
+        addon_rank = addon_order.get(
+            self._normalized_addon_url(source.addon_url),
+            len(addon_order),
+        )
+
+        source_type = str(source.source_type or "").strip().lower()
+        source_rank = {
+            "direct": 0,
+            "external": 1,
+            "torrent": 2 if self._debrid_enabled() else 4,
+        }.get(source_type, 3)
+
+        return (
+            quality_rank,
+            addon_rank,
+            source_rank,
+            str(source.name or "").casefold(),
+            str(source.id or ""),
+        )
+
+    @staticmethod
+    def _normalized_addon_url(value: str | None) -> str:
+        url = str(value or "").strip().rstrip("/")
+        if url.endswith("/manifest.json"):
+            url = url[:-len("/manifest.json")]
+        return url.casefold()
 
     async def _resolve_candidate(self, candidate: StreamCandidate) -> str | None:
         source_url = str(candidate.url or "").strip()
@@ -752,9 +801,9 @@ class PlaybackResolver:
             "|".join(self._addon_urls()).encode("utf-8", errors="ignore")
         ).hexdigest()[:12]
 
-        # v3 intentionally invalidates old capped source-set cache entries.
+        # v4 invalidates the previous ordering cache while preserving stable source IDs.
         return (
-            f"playback:v3:{provider}:{addon_fingerprint}:"
+            f"playback:v4:{provider}:{addon_fingerprint}:"
             f"{item_id}:{season}:{episode}"
         )
 

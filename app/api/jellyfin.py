@@ -158,6 +158,36 @@ def _media_source(
     }
 
 
+def _display_name(meta: dict[str, Any]) -> str:
+    raw = meta.get("raw")
+    if not isinstance(raw, dict):
+        raw = {}
+
+    candidates = [
+        raw.get("title"),
+        meta.get("name"),
+        raw.get("name"),
+        raw.get("originalTitle"),
+        raw.get("original_title"),
+    ]
+
+    generic = {
+        "",
+        "stream",
+        "stremio stream",
+        "video",
+        "movie",
+        "series",
+    }
+
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if value and value.lower() not in generic:
+            return value
+
+    return str(meta.get("id") or meta.get("imdb_id") or "Unknown")
+
+
 def _item(meta: dict[str, Any], collection: str) -> dict[str, Any]:
     item_id = meta.get("id") or meta.get("imdb_id")
 
@@ -166,10 +196,12 @@ def _item(meta: dict[str, Any], collection: str) -> dict[str, Any]:
 
     raw_type = str(meta.get("type") or "").lower()
     is_series = raw_type == "series"
+    display_name = _display_name(meta)
 
     dto: dict[str, Any] = {
-        "Name": meta.get("name") or item_id,
-        "OriginalTitle": meta.get("name") or item_id,
+        "Name": display_name,
+        "OriginalTitle": display_name,
+        "SortName": display_name,
         "ServerId": "stremfin",
         "Id": item_id,
         "Etag": f"{item_id}-stremfin",
@@ -201,7 +233,7 @@ def _item(meta: dict[str, Any], collection: str) -> dict[str, Any]:
         "MediaSources": (
             []
             if is_series
-            else [_media_source(item_id, meta.get("name"))]
+            else [_media_source(item_id, display_name)]
         ),
     }
 
@@ -1001,6 +1033,7 @@ async def _attach_playback_media(
 @router.get("/emby/Users/{user_id}/Items")
 @router.get("/Users/{user_id}/Items")
 async def get_items(
+    request: Request,
     user_id: str | None = None,
     parent_id: str | None = Query(
         None,
@@ -1026,6 +1059,30 @@ async def get_items(
             status_code=404,
             detail="User not found",
         )
+
+    # Jellyfin commonly uses PascalCase query names, while Infuse sends
+    # lower-camel-case variants such as parentId/includeItemTypes/startIndex.
+    # Starlette query keys are case-sensitive, so normalize them here.
+    query = {
+        str(key).lower(): value
+        for key, value in request.query_params.multi_items()
+    }
+
+    parent_id = query.get("parentid", parent_id)
+    include_item_types = query.get(
+        "includeitemtypes",
+        include_item_types,
+    )
+
+    try:
+        start_index = int(query.get("startindex", start_index))
+    except (TypeError, ValueError):
+        start_index = 0
+
+    try:
+        limit = int(query.get("limit", limit))
+    except (TypeError, ValueError):
+        limit = DEFAULT_PAGE_SIZE
 
     start_index, limit = _normalize_page(
         start_index,
@@ -1393,6 +1450,30 @@ async def item_counts(
         "BookCount": 0,
         "ItemCount": movie_count + series_count,
     }
+
+
+# ---------------------------------------------------------------------------
+# Local trailers compatibility
+# ---------------------------------------------------------------------------
+
+
+@router.get("/emby/Users/{user_id}/Items/{item_id}/LocalTrailers")
+@router.get("/Users/{user_id}/Items/{item_id}/LocalTrailers")
+@router.get("/emby/Items/{item_id}/LocalTrailers")
+@router.get("/Items/{item_id}/LocalTrailers")
+async def local_trailers(
+    item_id: str,
+    user_id: str | None = None,
+):
+    if user_id and user_id != USER_ID:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found",
+        )
+
+    # Stremfin does not expose local trailer files. A valid empty collection
+    # is preferable to 404 and matches clients that treat trailers as optional.
+    return []
 
 
 # ---------------------------------------------------------------------------

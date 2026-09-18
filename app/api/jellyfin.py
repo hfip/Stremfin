@@ -624,6 +624,111 @@ async def grouping_options(user_id: str):
 
 
 # ---------------------------------------------------------------------------
+# Library / Emby compatibility
+# ---------------------------------------------------------------------------
+
+
+@router.get("/emby/Library/VirtualFolders")
+@router.get("/Library/VirtualFolders")
+async def virtual_folders():
+    """
+    Return Stremfin's two virtual libraries in Jellyfin/Emby VirtualFolder
+    shape. Infuse uses this endpoint while adding a server.
+    """
+
+    return [
+        {
+            "Name": "Movies",
+            "Locations": [],
+            "CollectionType": "movies",
+            "LibraryOptions": {
+                "Enabled": True,
+                "EnablePhotos": False,
+                "EnableRealtimeMonitor": False,
+                "EnableChapterImageExtraction": False,
+                "ExtractChapterImagesDuringLibraryScan": False,
+                "EnableInternetProviders": False,
+                "SaveLocalMetadata": False,
+                "EnableAutomaticSeriesGrouping": False,
+                "EnableEmbeddedTitles": False,
+                "EnableEmbeddedEpisodeInfos": False,
+                "AutomaticRefreshIntervalDays": 0,
+                "PreferredMetadataLanguage": None,
+                "MetadataCountryCode": None,
+                "SeasonZeroDisplayName": "Specials",
+                "MetadataSavers": [],
+                "DisabledLocalMetadataReaders": [],
+                "LocalMetadataReaderOrder": [],
+                "DisabledSubtitleFetchers": [],
+                "SubtitleFetcherOrder": [],
+                "SkipSubtitlesIfEmbeddedSubtitlesPresent": False,
+                "SkipSubtitlesIfAudioTrackMatches": False,
+                "SubtitleDownloadLanguages": [],
+                "RequirePerfectSubtitleMatch": False,
+                "SaveSubtitlesWithMedia": False,
+                "AutomaticallyAddToCollection": False,
+                "AllowEmbeddedSubtitles": "AllowAll",
+                "TypeOptions": [],
+            },
+            "ItemId": MOVIES_VIEW_ID,
+            "PrimaryImageItemId": None,
+            "RefreshProgress": 0.0,
+            "RefreshStatus": "Idle",
+        },
+        {
+            "Name": "TV Shows",
+            "Locations": [],
+            "CollectionType": "tvshows",
+            "LibraryOptions": {
+                "Enabled": True,
+                "EnablePhotos": False,
+                "EnableRealtimeMonitor": False,
+                "EnableChapterImageExtraction": False,
+                "ExtractChapterImagesDuringLibraryScan": False,
+                "EnableInternetProviders": False,
+                "SaveLocalMetadata": False,
+                "EnableAutomaticSeriesGrouping": False,
+                "EnableEmbeddedTitles": False,
+                "EnableEmbeddedEpisodeInfos": False,
+                "AutomaticRefreshIntervalDays": 0,
+                "PreferredMetadataLanguage": None,
+                "MetadataCountryCode": None,
+                "SeasonZeroDisplayName": "Specials",
+                "MetadataSavers": [],
+                "DisabledLocalMetadataReaders": [],
+                "LocalMetadataReaderOrder": [],
+                "DisabledSubtitleFetchers": [],
+                "SubtitleFetcherOrder": [],
+                "SkipSubtitlesIfEmbeddedSubtitlesPresent": False,
+                "SkipSubtitlesIfAudioTrackMatches": False,
+                "SubtitleDownloadLanguages": [],
+                "RequirePerfectSubtitleMatch": False,
+                "SaveSubtitlesWithMedia": False,
+                "AutomaticallyAddToCollection": False,
+                "AllowEmbeddedSubtitles": "AllowAll",
+                "TypeOptions": [],
+            },
+            "ItemId": TVSHOWS_VIEW_ID,
+            "PrimaryImageItemId": None,
+            "RefreshProgress": 0.0,
+            "RefreshStatus": "Idle",
+        },
+    ]
+
+
+@router.get("/emby/System/Ext/ServerDomains")
+@router.get("/System/Ext/ServerDomains")
+async def server_domains():
+    """
+    Emby compatibility endpoint used by Rex during server discovery.
+
+    Stremfin does not advertise additional server domains.
+    """
+
+    return []
+
+
+# ---------------------------------------------------------------------------
 # Metadata lookup
 # ---------------------------------------------------------------------------
 

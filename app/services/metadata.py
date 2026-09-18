@@ -16,25 +16,14 @@ class MetadataService:
     """
     Aggregate metadata from configured Stremio addons.
 
-    This service is intentionally Jellyfin-agnostic. Its job is to turn
-    different Stremio addon responses into one predictable canonical shape
-    which the Jellyfin API layer can consume safely.
-
-    Important rules:
-
-    1. Catalog entries are normalized before being returned.
-    2. Duplicate media is removed before pagination/window slicing.
-    3. Catalog requests can walk Stremio `skip` windows when supported.
-    4. A slow/broken addon must not break the complete catalog.
-    5. Metadata lookups are cached per addon/type/item.
+    Catalog pagination uses a cached complete snapshot. For addons advertising
+    Stremio's `skip` extra, pages are followed until exhaustion, then selected
+    catalogs are merged and de-duplicated in stable configured order.
     """
 
     DEFAULT_CATALOG_PAGE_SIZE = 20
-
-    # Progressive pagination means we only walk as far as the Jellyfin client
-    # currently needs. These are safety ceilings, not visible page limits.
-    MAX_CATALOG_PAGES_PER_ADDON = 100
-    MAX_CATALOG_ITEMS = 5000
+    MAX_CATALOG_PAGES_PER_ADDON = 250
+    MAX_CATALOG_ITEMS = 20000
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -156,43 +145,15 @@ class MetadataService:
         limit: int,
         selected: list[dict],
     ) -> list[dict]:
-        """
-        Return up to `limit` unique normalized entries.
-
-        This remains backward compatible with the existing Jellyfin layer.
-        Page-aware clients should prefer `catalog_page()` below.
-        """
-        endpoint_type = "series" if kind in ("series", "tv") else "movie"
-
+        """Backward-compatible catalog window backed by the full snapshot."""
         try:
             requested_limit = int(limit)
         except (TypeError, ValueError):
             requested_limit = self.DEFAULT_CATALOG_PAGE_SIZE
 
         requested_limit = max(1, min(requested_limit, self.MAX_CATALOG_ITEMS))
-        catalogs = self._selected_catalogs(selected, endpoint_type)
-        if not catalogs:
-            return []
-
-        unique: dict[str, dict] = {}
-
-        # Preserve configured catalog order so StartIndex windows are stable.
-        for catalog in catalogs:
-            if len(unique) >= requested_limit:
-                break
-
-            items = await self._catalog_window(catalog, requested_limit)
-
-            for item in items:
-                identity = self._identity(item)
-                if not identity:
-                    continue
-                if identity not in unique:
-                    unique[identity] = item
-                if len(unique) >= requested_limit:
-                    break
-
-        return list(unique.values())[:requested_limit]
+        snapshot = await self._catalog_snapshot(kind, selected)
+        return snapshot[:requested_limit]
 
     async def catalog_page(
         self,
@@ -202,16 +163,7 @@ class MetadataService:
         selected: list[dict],
     ) -> dict:
         """
-        Return a Jellyfin-friendly progressive catalog page.
-
-        We intentionally probe exactly one item beyond the requested window.
-        That lets the API distinguish "this is the final page" from "there is
-        another page" without downloading the whole Stremio catalog.
-
-        `total_record_count` is exact once the end is reached. Before that it
-        is a monotonic lower bound (end_of_page + 1), which is sufficient for
-        clients such as Infuse to continue requesting the next StartIndex.
-        Cached Stremio skip pages make subsequent probes inexpensive.
+        Return an exact page and exact TotalRecordCount from one stable snapshot.
         """
         try:
             start = max(0, int(start_index))
@@ -224,34 +176,107 @@ class MetadataService:
             page_limit = self.DEFAULT_CATALOG_PAGE_SIZE
 
         page_limit = min(page_limit, 500)
-        window_end = start + page_limit
-        probe_limit = min(window_end + 1, self.MAX_CATALOG_ITEMS)
-
-        aggregated = await self.catalog(
-            kind=kind,
-            limit=probe_limit,
-            selected=selected,
-        )
-
-        page_items = aggregated[start:window_end]
-        has_more = len(aggregated) > window_end
-
-        if has_more:
-            total_record_count = window_end + 1
-        else:
-            total_record_count = len(aggregated)
-
-        # Never report a total below the first index represented by this page.
-        total_record_count = max(total_record_count, start + len(page_items))
+        snapshot = await self._catalog_snapshot(kind, selected)
+        total = len(snapshot)
+        end = min(start + page_limit, total)
 
         return {
-            "items": page_items,
+            "items": snapshot[start:end],
             "start_index": start,
             "limit": page_limit,
-            "has_more": has_more,
-            "total_record_count": total_record_count,
-            "is_total_exact": not has_more,
+            "has_more": end < total,
+            "total_record_count": total,
+            "is_total_exact": True,
         }
+
+    async def _catalog_snapshot(
+        self,
+        kind: str,
+        selected: list[dict],
+    ) -> list[dict]:
+        endpoint_type = "series" if kind in ("series", "tv") else "movie"
+        catalogs = self._selected_catalogs(selected, endpoint_type)
+        if not catalogs:
+            return []
+
+        signature = "|".join(
+            f"{catalog.get('addon_url')}::{catalog.get('type')}::{catalog.get('id')}"
+            for catalog in catalogs
+        )
+        key = f"catalog-snapshot:v2:{endpoint_type}:{signature}"
+
+        return await metadata_cache.get_or_set(
+            key,
+            lambda: self._build_catalog_snapshot(catalogs),
+        )
+
+    async def _build_catalog_snapshot(
+        self,
+        catalogs: list[dict],
+    ) -> list[dict]:
+        # Fetch independent selected catalogs concurrently. Their final merge
+        # still follows configured order because gather preserves task order.
+        responses = await asyncio.gather(
+            *(self._complete_catalog(catalog) for catalog in catalogs),
+            return_exceptions=True,
+        )
+
+        unique: dict[str, dict] = {}
+        for response in responses:
+            if isinstance(response, BaseException):
+                continue
+            self._merge_unique(unique, response)
+            if len(unique) >= self.MAX_CATALOG_ITEMS:
+                break
+
+        return list(unique.values())[: self.MAX_CATALOG_ITEMS]
+
+    async def _complete_catalog(self, catalog: dict) -> list[dict]:
+        base_items = await self._cached_catalog_page(
+            catalog,
+            skip=0,
+            use_skip=False,
+        )
+        if not base_items:
+            return []
+
+        unique: dict[str, dict] = {}
+        self._merge_unique(unique, base_items)
+
+        if not self._supports_skip(catalog):
+            return list(unique.values())
+
+        page_size = max(1, min(len(base_items), 100))
+        skip = page_size
+        pages_loaded = 1
+
+        while (
+            pages_loaded < self.MAX_CATALOG_PAGES_PER_ADDON
+            and len(unique) < self.MAX_CATALOG_ITEMS
+        ):
+            page = await self._cached_catalog_page(
+                catalog,
+                skip=skip,
+                use_skip=True,
+            )
+            pages_loaded += 1
+
+            if not page:
+                break
+
+            previous_count = len(unique)
+            self._merge_unique(unique, page)
+
+            # Protect against addons that advertise skip but ignore it.
+            if len(unique) == previous_count:
+                break
+
+            if len(page) < page_size:
+                break
+
+            skip += page_size
+
+        return list(unique.values())[: self.MAX_CATALOG_ITEMS]
 
     def _selected_catalogs(
         self,
@@ -285,55 +310,9 @@ class MetadataService:
         catalog: dict,
         required_count: int,
     ) -> list[dict]:
-        base_items = await self._cached_catalog_page(
-            catalog,
-            skip=0,
-            use_skip=False,
-        )
-        if not base_items:
-            return []
-
-        unique: dict[str, dict] = {}
-        self._merge_unique(unique, base_items)
-
-        if len(unique) >= required_count:
-            return list(unique.values())[:required_count]
-
-        if not self._supports_skip(catalog):
-            return list(unique.values())[:required_count]
-
-        page_size = len(base_items) or self.DEFAULT_CATALOG_PAGE_SIZE
-        page_size = max(1, min(page_size, 100))
-        skip = page_size
-        pages_loaded = 1
-
-        while (
-            len(unique) < required_count
-            and pages_loaded < self.MAX_CATALOG_PAGES_PER_ADDON
-        ):
-            page = await self._cached_catalog_page(
-                catalog,
-                skip=skip,
-                use_skip=True,
-            )
-            pages_loaded += 1
-
-            if not page:
-                break
-
-            previous_count = len(unique)
-            self._merge_unique(unique, page)
-
-            # Addon ignored skip and repeated the previous page.
-            if len(unique) == previous_count:
-                break
-
-            if len(page) < page_size:
-                break
-
-            skip += page_size
-
-        return list(unique.values())[:required_count]
+        """Compatibility helper retained for existing callers/tests."""
+        items = await self._complete_catalog(catalog)
+        return items[: max(1, int(required_count))]
 
     async def _cached_catalog_page(
         self,

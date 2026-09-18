@@ -197,6 +197,8 @@ def _provider_ids(meta: dict[str, Any]) -> dict[str, str]:
     raw_provider_ids = (
         raw.get("providerIds")
         or raw.get("provider_ids")
+        or raw.get("providerIDs")
+        or raw.get("ids")
         or {}
     )
     if not isinstance(raw_provider_ids, dict):
@@ -244,7 +246,10 @@ def _logo_url(meta: dict[str, Any]) -> str | None:
     value = (
         meta.get("logo")
         or raw.get("logo")
+        or raw.get("logoUrl")
+        or raw.get("logo_url")
         or raw.get("clearLogo")
+        or raw.get("clearLogoUrl")
         or raw.get("clearlogo")
         or raw.get("clear_logo")
     )
@@ -407,11 +412,23 @@ def _episode_dto(
         episode,
     )
 
-    name = (
-        video.get("name")
-        or video.get("title")
-        or f"Episode {episode}"
+    raw_episode_name = (
+        video.get("title")
+        or video.get("name")
+        or ""
     )
+    raw_episode_name = str(raw_episode_name).strip()
+
+    if raw_episode_name.lower() in {
+        "",
+        "stream",
+        "stremio stream",
+        "video",
+        "episode",
+    }:
+        name = f"Episode {episode}"
+    else:
+        name = raw_episode_name
 
     return {
         "Name": name,
@@ -899,29 +916,88 @@ async def display_preferences(
 # ---------------------------------------------------------------------------
 
 
+def _metadata_addon_urls(
+    runtime,
+    saved,
+    kind: str | None = None,
+) -> list[str]:
+    """
+    Metadata must come from the addons that own the selected catalogs, not
+    only from stream addons.
+
+    The previous implementation queried runtime.addon_urls here. Those URLs
+    are the configured stream addons and can legitimately return generic
+    stream-oriented metadata such as Name="stream". That contaminated Movie
+    and Episode DTOs even though the selected catalog addon knew the real
+    title, provider IDs and artwork.
+
+    Preserve selected-catalog order, optionally filtered by media type, then
+    keep runtime addon URLs as fallbacks.
+    """
+
+    wanted = (
+        "series"
+        if str(kind or "").lower() in {"series", "tv", "tvshow", "tvshows"}
+        else "movie"
+        if str(kind or "").lower() in {"movie", "movies", "film", "films"}
+        else None
+    )
+
+    urls: list[str] = []
+
+    for catalog in saved.selected_catalogs:
+        if not isinstance(catalog, dict):
+            continue
+
+        catalog_type = str(catalog.get("type") or "").strip().lower()
+
+        if catalog_type in {"tv", "show", "shows", "tvshow", "tvshows"}:
+            catalog_type = "series"
+        elif catalog_type in {"movies", "film", "films"}:
+            catalog_type = "movie"
+
+        if wanted and catalog_type != wanted:
+            continue
+
+        value = str(catalog.get("addon_url") or "").strip()
+        value = value.removesuffix("/manifest.json").rstrip("/")
+
+        if value and value not in urls:
+            urls.append(value)
+
+    for value in runtime.addon_urls:
+        value = str(value or "").strip()
+        value = value.removesuffix("/manifest.json").rstrip("/")
+
+        if value and value not in urls:
+            urls.append(value)
+
+    return urls
+
+
 async def _lookup_series(series_id: str):
-    runtime, _ = _runtime(get_settings())
+    runtime, saved = _runtime(get_settings())
 
     service = MetadataService(runtime)
 
     meta = await service.details(
         series_id,
         "series",
-        runtime.addon_urls,
+        _metadata_addon_urls(runtime, saved, "series"),
     )
 
     return runtime, meta
 
 
 async def _lookup_movie(movie_id: str):
-    runtime, _ = _runtime(get_settings())
+    runtime, saved = _runtime(get_settings())
 
     service = MetadataService(runtime)
 
     meta = await service.details(
         movie_id,
         "movie",
-        runtime.addon_urls,
+        _metadata_addon_urls(runtime, saved, "movie"),
     )
 
     return runtime, meta
@@ -1336,7 +1412,7 @@ async def get_items(
                 detailed = await service.details(
                     str(lookup_id),
                     "movie",
-                    runtime.addon_urls,
+                    _metadata_addon_urls(runtime, saved, "movie"),
                 )
             except Exception:
                 detailed = None
@@ -1792,11 +1868,14 @@ async def seasons(
     ordered = sorted(values)
 
     items = [
-        _season_dto(
-            series_id,
-            meta.get("name"),
-            number,
-        )
+        {
+            **_season_dto(
+                series_id,
+                meta.get("name"),
+                number,
+            ),
+            "ProviderIds": _provider_ids(meta),
+        }
         for number in ordered
     ]
 
@@ -1882,16 +1961,30 @@ async def episodes(
 
     values = _sort_episodes(values)
 
-    items = [
-        _episode_dto(
+    items = []
+
+    for video in values:
+        if (
+            video.get("season") is None
+            or video.get("episode") is None
+        ):
+            continue
+
+        dto = _episode_dto(
             series_id,
             meta.get("name"),
             video,
         )
-        for video in values
-        if video.get("season") is not None
-        and video.get("episode") is not None
-    ]
+
+        episode_meta = {
+            "raw": video,
+            "imdb_id": video.get("imdb_id") or video.get("imdbId"),
+        }
+        provider_ids = _provider_ids(meta)
+        provider_ids.update(_provider_ids(episode_meta))
+        dto["ProviderIds"] = provider_ids
+
+        items.append(dto)
 
     page = _paginate(
         items,

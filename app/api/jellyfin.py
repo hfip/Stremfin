@@ -143,6 +143,32 @@ def _metadata_etag(*values: Any) -> str:
     return hashlib.sha1(payload).hexdigest()
 
 
+def _virtual_media_filename(
+    name: str | None,
+    item_id: str,
+) -> str:
+    value = str(name or "").strip()
+
+    if not value or value.lower() in {
+        "stream",
+        "stremio stream",
+        "video",
+    }:
+        value = str(item_id or "media").strip()
+
+    value = re.sub(
+        r'[\\/:*?"<>|]+',
+        " ",
+        value,
+    )
+    value = re.sub(r"\s+", " ", value).strip(" .")
+
+    if not value:
+        value = str(item_id or "media")
+
+    return f"{value}.mkv"
+
+
 def _media_source(
     item_id: str,
     name: str | None,
@@ -150,7 +176,10 @@ def _media_source(
     return {
         "Id": item_id,
         "Name": name or item_id,
-        "Path": f"/Videos/{item_id}/stream",
+        "Path": _virtual_media_filename(
+            name,
+            item_id,
+        ),
         "Protocol": "Http",
         "Type": "Default",
         "Container": None,
@@ -285,6 +314,14 @@ def _item(meta: dict[str, Any], collection: str) -> dict[str, Any]:
         "Name": display_name,
         "OriginalTitle": display_name,
         "SortName": display_name,
+        "FileName": (
+            None
+            if is_series
+            else _virtual_media_filename(
+                display_name,
+                str(item_id),
+            )
+        ),
         "ServerId": "stremfin",
         "Id": item_id,
         "Etag": _metadata_etag(
@@ -298,6 +335,14 @@ def _item(meta: dict[str, Any], collection: str) -> dict[str, Any]:
         ),
         "Type": "Series" if is_series else "Movie",
         "CollectionType": collection,
+        "Path": (
+            None
+            if is_series
+            else _virtual_media_filename(
+                display_name,
+                str(item_id),
+            )
+        ),
         "IsFolder": is_series,
         "MediaType": "Unknown" if is_series else "Video",
         "RunTimeTicks": (
@@ -463,6 +508,10 @@ def _episode_dto(
     return {
         "Name": name,
         "OriginalTitle": name,
+        "FileName": _virtual_media_filename(
+            name,
+            episode_id,
+        ),
         "ServerId": "stremfin",
         "Id": episode_id,
         "Etag": _metadata_etag(
@@ -477,6 +526,10 @@ def _episode_dto(
         "IsFolder": False,
         "MediaType": "Video",
         "LocationType": "Remote",
+        "Path": _virtual_media_filename(
+            name,
+            episode_id,
+        ),
         "SeriesId": series_id,
         "SeriesName": series_name or "",
         "SeasonId": season_id,

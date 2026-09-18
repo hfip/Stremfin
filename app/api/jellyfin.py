@@ -460,6 +460,7 @@ def _sort_episodes(
 # ---------------------------------------------------------------------------
 
 
+@router.get("/emby/System/Info")
 @router.get("/System/Info")
 async def system_info(
     settings: Settings = Depends(get_settings),
@@ -467,6 +468,7 @@ async def system_info(
     return _server_info(settings)
 
 
+@router.get("/emby/System/Info/Public")
 @router.get("/System/Info/Public")
 async def public_system_info(
     settings: Settings = Depends(get_settings),
@@ -525,6 +527,7 @@ async def authenticate(
     }
 
 
+@router.get("/emby/Users/{user_id}")
 @router.get("/Users/{user_id}")
 async def get_user(user_id: str):
     if user_id != USER_ID:
@@ -583,6 +586,7 @@ def _views():
     }
 
 
+@router.get("/emby/Users/{user_id}/Views")
 @router.get("/Users/{user_id}/Views")
 async def get_views(user_id: str):
     if user_id != USER_ID:
@@ -594,9 +598,29 @@ async def get_views(user_id: str):
     return _views()
 
 
+@router.get("/emby/UserViews")
 @router.get("/UserViews")
 async def user_views():
     return _views()
+
+
+@router.get("/emby/Users/{user_id}/GroupingOptions")
+@router.get("/Users/{user_id}/GroupingOptions")
+async def grouping_options(user_id: str):
+    """
+    Jellyfin/Emby compatibility endpoint used by Infuse during library setup.
+
+    Stremfin exposes Movies and TV Shows as fixed virtual views and does not
+    currently offer alternate grouping modes, so an empty list is the correct
+    non-error response.
+    """
+    if user_id != USER_ID:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found",
+        )
+
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -809,7 +833,9 @@ async def _attach_playback_media(
 # ---------------------------------------------------------------------------
 
 
+@router.get("/emby/Items")
 @router.get("/Items")
+@router.get("/emby/Users/{user_id}/Items")
 @router.get("/Users/{user_id}/Items")
 async def get_items(
     user_id: str | None = None,
@@ -1033,7 +1059,9 @@ async def get_items(
 # ---------------------------------------------------------------------------
 
 
+@router.get("/emby/Items/Latest")
 @router.get("/Items/Latest")
+@router.get("/emby/Users/{user_id}/Items/Latest")
 @router.get("/Users/{user_id}/Items/Latest")
 async def latest_items(
     user_id: str | None = None,
@@ -1168,7 +1196,9 @@ async def item_counts(
 # ---------------------------------------------------------------------------
 
 
+@router.get("/emby/Items/{item_id}")
 @router.get("/Items/{item_id}")
+@router.get("/emby/Users/{user_id}/Items/{item_id}")
 @router.get("/Users/{user_id}/Items/{item_id}")
 async def get_item(
     item_id: str,
@@ -1268,6 +1298,7 @@ async def get_item(
 # ---------------------------------------------------------------------------
 
 
+@router.get("/emby/Shows/{series_id}/Seasons")
 @router.get("/Shows/{series_id}/Seasons")
 async def seasons(
     series_id: str,
@@ -1330,6 +1361,7 @@ async def seasons(
     }
 
 
+@router.get("/emby/Shows/{series_id}/Episodes")
 @router.get("/Shows/{series_id}/Episodes")
 async def episodes(
     series_id: str,
@@ -1427,6 +1459,7 @@ async def episodes(
 # ---------------------------------------------------------------------------
 
 
+@router.get("/emby/Items/{item_id}/Images/Primary")
 @router.get("/Items/{item_id}/Images/Primary")
 async def primary_image(item_id: str):
     _, meta = await _lookup(item_id)
@@ -1457,6 +1490,7 @@ async def primary_image(item_id: str):
     )
 
 
+@router.get("/emby/Items/{item_id}/Images/Backdrop")
 @router.get("/Items/{item_id}/Images/Backdrop")
 async def backdrop_image(item_id: str):
     _, meta = await _lookup(item_id)
@@ -1492,6 +1526,7 @@ async def backdrop_image(item_id: str):
 # ---------------------------------------------------------------------------
 
 
+@router.get("/emby/Subtitles/{item_id}/{index}/Stream.{format}")
 @router.get("/Subtitles/{item_id}/{index}/Stream.{format}")
 async def subtitle_stream(
     item_id: str,
@@ -1696,6 +1731,7 @@ async def _playback_response(
     return result
 
 
+@router.get("/emby/Items/{item_id}/PlaybackInfo")
 @router.get("/Items/{item_id}/PlaybackInfo")
 async def playback_info_get(
     item_id: str,
@@ -1703,6 +1739,7 @@ async def playback_info_get(
     return await _playback_response(item_id)
 
 
+@router.post("/emby/Items/{item_id}/PlaybackInfo")
 @router.post("/Items/{item_id}/PlaybackInfo")
 async def playback_info_post(
     item_id: str,
@@ -1721,6 +1758,7 @@ async def playback_info_post(
     return await _playback_response(item_id)
 
 
+@router.get("/emby/Videos/{item_id}/stream")
 @router.get("/Videos/{item_id}/stream")
 async def stream(
     item_id: str,

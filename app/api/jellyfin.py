@@ -169,6 +169,28 @@ def _virtual_media_filename(
     return f"{value}.mkv"
 
 
+def _virtual_media_path(
+    name: str | None,
+    item_id: str,
+) -> str:
+    """
+    A display-safe virtual path for Item DTOs.
+
+    Infuse may derive the visible title from Item.Path.  Keep this path free
+    from both the old literal "stream" and file extensions; the actual file
+    style name remains available separately in FileName.
+    """
+    filename = _virtual_media_filename(
+        name,
+        item_id,
+    )
+
+    if filename.lower().endswith(".mkv"):
+        return filename[:-4]
+
+    return filename
+
+
 def _media_source(
     item_id: str,
     name: str | None,
@@ -176,7 +198,7 @@ def _media_source(
     return {
         "Id": item_id,
         "Name": name or item_id,
-        "Path": _virtual_media_filename(
+        "Path": _virtual_media_path(
             name,
             item_id,
         ),
@@ -338,7 +360,7 @@ def _item(meta: dict[str, Any], collection: str) -> dict[str, Any]:
         "Path": (
             None
             if is_series
-            else _virtual_media_filename(
+            else _virtual_media_path(
                 display_name,
                 str(item_id),
             )
@@ -526,7 +548,7 @@ def _episode_dto(
         "IsFolder": False,
         "MediaType": "Video",
         "LocationType": "Remote",
-        "Path": _virtual_media_filename(
+        "Path": _virtual_media_path(
             name,
             episode_id,
         ),
@@ -1251,7 +1273,12 @@ async def _attach_playback_media(
         media_source["MediaStreams"] = existing_streams
 
     if media_sources:
+        # Keep every resolved source/version on the Item DTO.  Some Emby-style
+        # clients inspect MediaSources while others explicitly request
+        # AlternateMediaSources before deciding whether to show the Versions
+        # selector, so advertise both views of the same resolved set.
         dto["MediaSources"] = media_sources
+        dto["AlternateMediaSources"] = list(media_sources[1:])
 
         # Jellyfin clients may inspect the top-level MediaStreams before
         # opening PlaybackInfo. Mirror the first source's streams there.
@@ -1259,6 +1286,8 @@ async def _attach_playback_media(
             media_sources[0].get("MediaStreams") or []
         )
     else:
+        dto["AlternateMediaSources"] = []
+
         # Preserve subtitle discovery even if no playable stream was resolved.
         dto["MediaStreams"] = subtitle_streams
 

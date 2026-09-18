@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import re
 from typing import Any
 from uuid import uuid4
@@ -129,6 +131,18 @@ def _episode_id(
 # ---------------------------------------------------------------------------
 
 
+def _metadata_etag(*values: Any) -> str:
+    payload = json.dumps(
+        values,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    return hashlib.sha1(payload).hexdigest()
+
+
 def _media_source(
     item_id: str,
     name: str | None,
@@ -186,7 +200,7 @@ def _display_name(meta: dict[str, Any]) -> str:
         if value and value.lower() not in generic:
             return value
 
-    return str(meta.get("id") or meta.get("imdb_id") or "Unknown")
+    return str(meta.get("imdb_id") or meta.get("id") or "Unknown")
 
 
 def _provider_ids(meta: dict[str, Any]) -> dict[str, str]:
@@ -273,7 +287,15 @@ def _item(meta: dict[str, Any], collection: str) -> dict[str, Any]:
         "SortName": display_name,
         "ServerId": "stremfin",
         "Id": item_id,
-        "Etag": f"{item_id}-stremfin",
+        "Etag": _metadata_etag(
+            item_id,
+            display_name,
+            meta.get("year"),
+            meta.get("poster"),
+            meta.get("backdrop"),
+            _logo_url(meta),
+            _provider_ids(meta),
+        ),
         "Type": "Series" if is_series else "Movie",
         "CollectionType": collection,
         "IsFolder": is_series,
@@ -412,30 +434,45 @@ def _episode_dto(
         episode,
     )
 
-    raw_episode_name = (
-        video.get("title")
-        or video.get("name")
-        or ""
-    )
-    raw_episode_name = str(raw_episode_name).strip()
-
-    if raw_episode_name.lower() in {
+    generic_episode_names = {
         "",
         "stream",
         "stremio stream",
         "video",
         "episode",
-    }:
+    }
+
+    name = ""
+
+    for candidate in (
+        video.get("name"),
+        video.get("title"),
+    ):
+        candidate = str(candidate or "").strip()
+
+        if (
+            candidate
+            and candidate.lower() not in generic_episode_names
+        ):
+            name = candidate
+            break
+
+    if not name:
         name = f"Episode {episode}"
-    else:
-        name = raw_episode_name
 
     return {
         "Name": name,
         "OriginalTitle": name,
         "ServerId": "stremfin",
         "Id": episode_id,
-        "Etag": f"{episode_id}-stremfin",
+        "Etag": _metadata_etag(
+            episode_id,
+            name,
+            video.get("overview"),
+            video.get("description"),
+            video.get("released"),
+            video.get("thumbnail"),
+        ),
         "Type": "Episode",
         "IsFolder": False,
         "MediaType": "Video",
@@ -1257,7 +1294,7 @@ async def get_items(
             meta = await service.details(
                 series_id,
                 "series",
-                runtime.addon_urls,
+                _metadata_addon_urls(runtime, saved, "series"),
             )
 
             if not meta:
@@ -1314,7 +1351,7 @@ async def get_items(
         meta = await service.details(
             parent_id,
             "series",
-            runtime.addon_urls,
+            _metadata_addon_urls(runtime, saved, "series"),
         )
 
         if not meta:
@@ -1401,23 +1438,66 @@ async def get_items(
         }
 
         async def enrich_movie(meta: dict[str, Any]) -> dict[str, Any]:
-            if _display_name(meta).strip().lower() not in generic_names:
+            raw = meta.get("raw")
+            if not isinstance(raw, dict):
+                raw = {}
+
+            catalog_name = str(
+                meta.get("name")
+                or raw.get("name")
+                or raw.get("title")
+                or ""
+            ).strip()
+
+            if catalog_name.lower() not in generic_names:
                 return meta
 
-            lookup_id = meta.get("id") or meta.get("imdb_id")
-            if not lookup_id:
+            lookup_ids: list[str] = []
+
+            for value in (
+                meta.get("imdb_id"),
+                meta.get("id"),
+                raw.get("imdb_id"),
+                raw.get("imdbId"),
+                raw.get("id"),
+            ):
+                value = str(value or "").strip()
+                if value and value not in lookup_ids:
+                    lookup_ids.append(value)
+
+            if not lookup_ids:
                 return meta
 
-            try:
-                detailed = await service.details(
-                    str(lookup_id),
-                    "movie",
-                    _metadata_addon_urls(runtime, saved, "movie"),
-                )
-            except Exception:
-                detailed = None
+            metadata_addons = _metadata_addon_urls(
+                runtime,
+                saved,
+                "movie",
+            )
 
-            return detailed or meta
+            for lookup_id in lookup_ids:
+                try:
+                    detailed = await service.details(
+                        lookup_id,
+                        "movie",
+                        metadata_addons,
+                    )
+                except Exception:
+                    detailed = None
+
+                if not detailed:
+                    continue
+
+                detailed_name = str(
+                    detailed.get("name") or ""
+                ).strip()
+
+                if (
+                    detailed_name
+                    and detailed_name.lower() not in generic_names
+                ):
+                    return detailed
+
+            return meta
 
         metas = list(
             await asyncio.gather(

@@ -729,6 +729,55 @@ async def server_domains():
 
 
 # ---------------------------------------------------------------------------
+# Display preferences
+# ---------------------------------------------------------------------------
+
+
+@router.get("/emby/DisplayPreferences/{display_id}")
+@router.get("/DisplayPreferences/{display_id}")
+async def display_preferences(
+    display_id: str,
+    user_id: str | None = Query(
+        None,
+        alias="userId",
+    ),
+    client: str | None = Query(
+        None,
+        alias="client",
+    ),
+):
+    """
+    Minimal Jellyfin/Emby DisplayPreferences response used by Infuse.
+
+    Stremfin does not persist client-specific presentation settings yet, so we
+    return stable defaults instead of inventing user preferences.
+    """
+
+    if user_id and user_id != USER_ID:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found",
+        )
+
+    return {
+        "Id": display_id,
+        "ViewType": "Poster",
+        "SortBy": "SortName",
+        "IndexBy": "None",
+        "RememberIndexing": False,
+        "PrimaryImageHeight": 250,
+        "PrimaryImageWidth": 250,
+        "CustomPrefs": {},
+        "ScrollDirection": "Horizontal",
+        "ShowBackdrop": True,
+        "RememberSorting": False,
+        "SortOrder": "Ascending",
+        "ShowSidebar": True,
+        "Client": client or "emby",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Metadata lookup
 # ---------------------------------------------------------------------------
 

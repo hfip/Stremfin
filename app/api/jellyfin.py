@@ -2315,12 +2315,17 @@ async def backdrop_image(item_id: str):
 # ---------------------------------------------------------------------------
 
 
+@router.get("/emby/Videos/{item_id}/{media_source_id}/Subtitles/{index}/Stream.{format}")
+@router.get("/Videos/{item_id}/{media_source_id}/Subtitles/{index}/Stream.{format}")
+@router.get("/emby/Videos/{item_id}/{media_source_id}/Subtitles/{index}/stream.{format}")
+@router.get("/Videos/{item_id}/{media_source_id}/Subtitles/{index}/stream.{format}")
 @router.get("/emby/Subtitles/{item_id}/{index}/Stream.{format}")
 @router.get("/Subtitles/{item_id}/{index}/Stream.{format}")
 async def subtitle_stream(
     item_id: str,
     index: int,
     format: str,
+    media_source_id: str | None = None,
 ):
     episode_parts = _parse_episode_id(item_id)
 
@@ -2347,27 +2352,13 @@ async def subtitle_stream(
 
     track = tracks[index]
 
-    async with httpx.AsyncClient(
-        timeout=runtime.request_timeout_seconds,
-        follow_redirects=True,
-    ) as client:
-        response = await client.get(track.url)
-        response.raise_for_status()
-
-    requested_format = format.lower()
-
-    if requested_format in {"vtt", "webvtt"}:
-        media_type = "text/vtt"
-    elif requested_format in {"srt", "subrip"}:
-        media_type = "application/x-subrip"
-    elif requested_format in {"ass", "ssa"}:
-        media_type = "text/x-ssa"
-    else:
-        media_type = "text/plain"
-
-    return Response(
-        response.content,
-        media_type=media_type,
+    # External subtitles are intentionally redirected to their original
+    # Stremio URL. This matches Jellyfin clients that expect the video-scoped
+    # subtitle endpoint to resolve to the external SRT/VTT/ASS resource and
+    # avoids buffering the subtitle body through Stremfin.
+    return RedirectResponse(
+        track.url,
+        status_code=302,
         headers={
             "Cache-Control": "public, max-age=900",
         },

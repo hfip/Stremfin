@@ -1190,28 +1190,57 @@ async def _subtitle_streams(
     season: int | None = None,
     episode: int | None = None,
 ):
+    """
+    Convert Stremio subtitle candidates to Jellyfin MediaStream DTOs.
+
+    The delivery URL must use the Jellyfin-facing episode id so the subtitle
+    endpoint can reconstruct the original series/season/episode identity.
+    Movies keep their normal item id.
+    """
     tracks = await SubtitleResolver(runtime).resolve(
         item_id,
         season,
         episode,
     )
 
-    return [
-        {
-            "Index": index,
-            "Type": "Subtitle",
-            "Language": track.language,
-            "DisplayTitle": track.title,
-            "IsExternal": True,
-            "IsTextSubtitleStream": True,
-            "SupportsExternalStream": True,
-            "DeliveryMethod": "External",
-            "DeliveryUrl": (
-                f"/Subtitles/{item_id}/{index}/Stream.{track.format}"
-            ),
-        }
-        for index, track in enumerate(tracks)
-    ]
+    if season is not None and episode is not None:
+        delivery_item_id = _episode_id(
+            item_id,
+            int(season),
+            int(episode),
+        )
+    else:
+        delivery_item_id = item_id
+
+    streams: list[dict[str, Any]] = []
+
+    for index, track in enumerate(tracks):
+        codec = str(track.format or "srt").strip().lower()
+        if codec == "subrip":
+            codec = "srt"
+        elif codec == "webvtt":
+            codec = "vtt"
+
+        streams.append(
+            {
+                "Index": index,
+                "Type": "Subtitle",
+                "Codec": codec,
+                "Language": track.language,
+                "Title": track.title,
+                "DisplayTitle": track.title,
+                "IsExternal": True,
+                "IsTextSubtitleStream": True,
+                "SupportsExternalStream": True,
+                "DeliveryMethod": "External",
+                "DeliveryUrl": (
+                    f"/Subtitles/{delivery_item_id}/{index}/"
+                    f"Stream.{codec}"
+                ),
+            }
+        )
+
+    return streams
 
 
 async def _attach_playback_media(
@@ -2327,16 +2356,21 @@ async def subtitle_stream(
 
     requested_format = format.lower()
 
-    if requested_format == "vtt":
+    if requested_format in {"vtt", "webvtt"}:
         media_type = "text/vtt"
     elif requested_format in {"srt", "subrip"}:
         media_type = "application/x-subrip"
+    elif requested_format in {"ass", "ssa"}:
+        media_type = "text/x-ssa"
     else:
         media_type = "text/plain"
 
     return Response(
         response.content,
         media_type=media_type,
+        headers={
+            "Cache-Control": "public, max-age=900",
+        },
     )
 
 

@@ -14,6 +14,11 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse, Response
 
 from app.config import Settings, get_settings
+from app.services.client_auth import (
+    configured_username,
+    credentials_are_valid,
+    user_auth_flags,
+)
 from app.services.metadata import MetadataService
 from app.services.playback import PlaybackResolver
 from app.services.settings_store import SettingsStore
@@ -725,24 +730,65 @@ async def authenticate(
     request: Request,
     settings: Settings = Depends(get_settings),
 ):
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid authentication request",
+        )
 
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid authentication request",
+        )
+
+    # Jellyfin normally sends Username + Pw. Some Emby-compatible clients use
+    # Password/password instead, so accept all common field names.
     username = (
         body.get("Username")
         or body.get("username")
         or "stremfin"
     )
+    password = (
+        body.get("Pw")
+        if body.get("Pw") is not None
+        else body.get("Password")
+        if body.get("Password") is not None
+        else body.get("password")
+        if body.get("password") is not None
+        else ""
+    )
+
+    if not credentials_are_valid(
+        settings,
+        username,
+        password,
+    ):
+        # Keep the failure generic: never reveal whether the username or the
+        # password was the mismatching value.
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid username or password",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    # In compatibility mode preserve the client-supplied display name. When
+    # protection is enabled, credentials_are_valid() guarantees that this is
+    # the configured username.
+    authenticated_username = str(username or "").strip() or configured_username(settings)
+    auth_flags = user_auth_flags(settings)
 
     token = uuid4().hex
     TOKENS.add(token)
 
     return {
         "User": {
-            "Name": username,
+            "Name": authenticated_username,
             "ServerId": settings.server_id,
             "Id": USER_ID,
-            "HasPassword": False,
-            "HasConfiguredPassword": False,
+            **auth_flags,
             "Configuration": {
                 "PlayDefaultAudioTrack": True,
                 "SubtitleMode": "Default",
@@ -751,7 +797,7 @@ async def authenticate(
         "SessionInfo": {
             "Id": uuid4().hex,
             "UserId": USER_ID,
-            "UserName": username,
+            "UserName": authenticated_username,
             "Client": "Stremfin",
             "DeviceName": "Stremfin",
             "DeviceId": "stremfin-client",
@@ -766,20 +812,23 @@ async def authenticate(
 
 @router.get("/emby/Users/{user_id}")
 @router.get("/Users/{user_id}")
-async def get_user(user_id: str):
+async def get_user(
+    user_id: str,
+    settings: Settings = Depends(get_settings),
+):
     if user_id != USER_ID:
         raise HTTPException(
             status_code=404,
             detail="User not found",
         )
 
+    auth_flags = user_auth_flags(settings)
+
     return {
-        "Name": "stremfin",
-        "ServerId": "stremfin",
+        "Name": configured_username(settings),
+        "ServerId": settings.server_id,
         "Id": USER_ID,
-        "HasPassword": False,
-        "HasConfiguredPassword": False,
-        "EnableAutoLogin": True,
+        **auth_flags,
         "Policy": {
             "IsAdministrator": True,
             "EnableAllFolders": True,

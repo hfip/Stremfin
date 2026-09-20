@@ -112,8 +112,16 @@ def _validate_addon_kind(result: dict[str, Any], kind: str | None) -> dict[str, 
         return {**result, "compatible": False, "requested_kind": normalized}
 
     if normalized == "stream":
-        compatible = bool(result.get("supports_streams"))
-        message = None if compatible else "This Stremio addon does not declare the stream resource."
+        compatible = bool(
+            result.get("supports_streams")
+            or result.get("supports_catalogs")
+            or result.get("supports_meta")
+        )
+        message = (
+            None
+            if compatible
+            else "This Stremio addon does not declare stream, catalog, or meta resources."
+        )
     else:
         compatible = bool(result.get("supports_subtitles"))
         message = None if compatible else "This Stremio addon does not declare the subtitles resource."
@@ -152,8 +160,15 @@ async def _inspect_manifest(raw_url: str, *, force: bool = False) -> dict[str, A
             timeout=timeout,
             follow_redirects=True,
             headers={
-                "Accept": "application/json",
-                "User-Agent": f"{settings.app_name}/{settings.app_version}",
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Cache-Control": "no-cache",
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0 Safari/537.36 "
+                    f"Stremfin/{settings.app_version}"
+                ),
             },
         ) as client:
             response = await client.get(manifest_url)
@@ -168,6 +183,7 @@ async def _inspect_manifest(raw_url: str, *, force: bool = False) -> dict[str, A
                 "base_url": _addon_base_url(manifest_url),
                 "status_code": response.status_code,
                 "latency_ms": latency_ms,
+                "inspection_state": "http_error",
                 "error": f"Manifest returned HTTP {response.status_code}",
             }
             _manifest_cache[manifest_url] = (now, result)
@@ -183,6 +199,7 @@ async def _inspect_manifest(raw_url: str, *, force: bool = False) -> dict[str, A
                 "base_url": _addon_base_url(manifest_url),
                 "status_code": response.status_code,
                 "latency_ms": latency_ms,
+                "inspection_state": "invalid_manifest",
                 "error": "Manifest response is not valid JSON",
             }
             _manifest_cache[manifest_url] = (now, result)
@@ -196,6 +213,7 @@ async def _inspect_manifest(raw_url: str, *, force: bool = False) -> dict[str, A
                 "base_url": _addon_base_url(manifest_url),
                 "status_code": response.status_code,
                 "latency_ms": latency_ms,
+                "inspection_state": "invalid_manifest",
                 "error": "Manifest JSON must be an object",
             }
             _manifest_cache[manifest_url] = (now, result)
@@ -213,6 +231,7 @@ async def _inspect_manifest(raw_url: str, *, force: bool = False) -> dict[str, A
                 "base_url": _addon_base_url(manifest_url),
                 "status_code": response.status_code,
                 "latency_ms": latency_ms,
+                "inspection_state": "invalid_manifest",
                 "error": "Response does not look like a Stremio manifest",
             }
             _manifest_cache[manifest_url] = (now, result)
@@ -221,6 +240,7 @@ async def _inspect_manifest(raw_url: str, *, force: bool = False) -> dict[str, A
         result = {
             "ok": True,
             "online": True,
+            "inspection_state": "valid",
             "url": manifest_url,
             "base_url": _addon_base_url(manifest_url),
             "status_code": response.status_code,
@@ -242,6 +262,7 @@ async def _inspect_manifest(raw_url: str, *, force: bool = False) -> dict[str, A
             "online": False,
             "url": manifest_url,
             "base_url": _addon_base_url(manifest_url),
+            "inspection_state": "timeout",
             "error": "Manifest request timed out",
         }
     except httpx.HTTPError as exc:
@@ -250,6 +271,7 @@ async def _inspect_manifest(raw_url: str, *, force: bool = False) -> dict[str, A
             "online": False,
             "url": manifest_url,
             "base_url": _addon_base_url(manifest_url),
+            "inspection_state": "network_error",
             "error": f"Manifest request failed: {exc.__class__.__name__}",
         }
     except Exception as exc:
@@ -258,6 +280,7 @@ async def _inspect_manifest(raw_url: str, *, force: bool = False) -> dict[str, A
             "online": False,
             "url": manifest_url,
             "base_url": _addon_base_url(manifest_url),
+            "inspection_state": "inspection_error",
             "error": f"Manifest inspection failed: {exc.__class__.__name__}",
         }
 
@@ -501,23 +524,35 @@ async def diagnostics(request: Request, force: bool = True):
             item = dict(raw)
 
         item = _validate_addon_kind(item, kind)
+        state = str(item.get("inspection_state") or ("valid" if item.get("ok") else "unknown"))
         addon_rows.append({
             "kind": kind,
             "priority": index + 1,
             "name": item.get("name") or urlparse(url).netloc or url,
             "url": item.get("url") or url,
             "online": bool(item.get("online")),
-            "valid_manifest": bool(item.get("ok")),
-            "compatible": bool(item.get("compatible")),
+            "valid_manifest": True if item.get("ok") else (False if state == "invalid_manifest" else None),
+            "compatible": bool(item.get("compatible")) if item.get("ok") else None,
+            "inspection_state": state,
+            "status_code": item.get("status_code"),
             "latency_ms": item.get("latency_ms"),
+            "supports_streams": bool(item.get("supports_streams")),
+            "supports_catalogs": bool(item.get("supports_catalogs")),
+            "supports_meta": bool(item.get("supports_meta")),
+            "supports_subtitles": bool(item.get("supports_subtitles")),
             "error": item.get("compatibility_error") or item.get("error"),
         })
 
     online = sum(1 for item in addon_rows if item["online"])
-    invalid = sum(1 for item in addon_rows if not item["valid_manifest"])
+    invalid = sum(1 for item in addon_rows if item["valid_manifest"] is False)
+    unreachable = sum(
+        1 for item in addon_rows
+        if item["inspection_state"] in {"timeout", "network_error", "inspection_error"}
+    )
+    http_errors = sum(1 for item in addon_rows if item["inspection_state"] == "http_error")
     incompatible = sum(
         1 for item in addon_rows
-        if item["valid_manifest"] and not item["compatible"]
+        if item["valid_manifest"] is True and item["compatible"] is False
     )
 
     database = _database_diagnostics()
@@ -532,7 +567,13 @@ async def diagnostics(request: Request, force: bool = True):
         "authentication_endpoint": "/Users/AuthenticateByName",
     }
 
-    overall_ok = bool(database.get("ok")) and invalid == 0 and incompatible == 0
+    overall_ok = (
+        bool(database.get("ok"))
+        and invalid == 0
+        and incompatible == 0
+        and unreachable == 0
+        and http_errors == 0
+    )
 
     return {
         "ok": overall_ok,
@@ -552,6 +593,8 @@ async def diagnostics(request: Request, force: bool = True):
             "online": online,
             "offline": len(addon_rows) - online,
             "invalid": invalid,
+            "unreachable": unreachable,
+            "http_errors": http_errors,
             "incompatible": incompatible,
             "stream": len(saved.stream_addon_urls),
             "subtitle": len(saved.subtitle_addon_urls),
@@ -564,6 +607,8 @@ async def diagnostics(request: Request, force: bool = True):
             "database": bool(database.get("ok")),
             "jellyfin_emby_api": True,
             "addons_valid": invalid == 0,
+            "addons_reachable": unreachable == 0,
+            "addons_http_ok": http_errors == 0,
             "addons_compatible": incompatible == 0,
         },
         "duration_ms": round((time.perf_counter() - started) * 1000),

@@ -94,6 +94,34 @@ def _manifest_capabilities(manifest: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _normalize_addon_kind(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return {"stream": "stream", "streams": "stream", "subtitle": "subtitle", "subtitles": "subtitle"}.get(value.strip().lower())
+
+
+def _validate_addon_kind(result: dict[str, Any], kind: str | None) -> dict[str, Any]:
+    normalized = _normalize_addon_kind(kind)
+    if kind is not None and normalized is None:
+        return {**result, "compatible": False, "requested_kind": str(kind), "compatibility_error": "Unsupported addon kind. Use 'stream' or 'subtitle'."}
+    if normalized is None:
+        return {**result, "compatible": bool(result.get("ok")), "requested_kind": None}
+    if not result.get("ok"):
+        return {**result, "compatible": False, "requested_kind": normalized}
+
+    if normalized == "stream":
+        compatible = bool(result.get("supports_streams"))
+        message = None if compatible else "This Stremio addon does not declare the stream resource."
+    else:
+        compatible = bool(result.get("supports_subtitles"))
+        message = None if compatible else "This Stremio addon does not declare the subtitles resource."
+
+    annotated = {**result, "compatible": compatible, "requested_kind": normalized}
+    if message:
+        annotated["compatibility_error"] = message
+    return annotated
+
+
 async def _inspect_manifest(raw_url: str, *, force: bool = False) -> dict[str, Any]:
     manifest_url = _normalize_manifest_url(raw_url)
     if not manifest_url:
@@ -300,19 +328,18 @@ async def save_dashboard_settings(request: Request, payload: AppSettings):
 
 
 @app.get("/api/addons/inspect")
-async def inspect_addon(request: Request, url: str, force: bool = False):
-    """Validate one Stremio manifest and return dashboard-friendly metadata."""
+async def inspect_addon(request: Request, url: str, force: bool = False, kind: str | None = None):
+    """Validate a Stremio manifest and optionally check stream/subtitle compatibility."""
     if (denied := await _require(request)):
         return denied
-    return await _inspect_manifest(url, force=force)
+    return _validate_addon_kind(await _inspect_manifest(url, force=force), kind)
 
 
 @app.post("/api/addons/inspect")
 async def inspect_addon_post(request: Request):
-    """POST variant useful for manifest URLs that are inconvenient in query strings."""
+    """POST manifest inspection with optional dashboard-section compatibility validation."""
     if (denied := await _require(request)):
         return denied
-
     try:
         body = await request.json()
     except Exception:
@@ -320,7 +347,9 @@ async def inspect_addon_post(request: Request):
 
     url = str(body.get("url") or "")
     force = bool(body.get("force", False))
-    return await _inspect_manifest(url, force=force)
+    kind_value = body.get("kind")
+    kind = str(kind_value) if kind_value is not None else None
+    return _validate_addon_kind(await _inspect_manifest(url, force=force), kind)
 
 
 @app.get("/api/addons/status")
@@ -363,16 +392,19 @@ async def addons_status(request: Request, force: bool = False):
         else:
             item = dict(result)
 
+        item = _validate_addon_kind(item, kind)
         item["kind"] = kind
         item["priority"] = index + 1
         addons.append(item)
 
     online = sum(1 for item in addons if item.get("online"))
+    incompatible = sum(1 for item in addons if item.get("ok") and item.get("compatible") is False)
     return {
         "ok": True,
         "total": len(addons),
         "online": online,
         "offline": len(addons) - online,
+        "incompatible": incompatible,
         "addons": addons,
     }
 

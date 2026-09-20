@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any
@@ -263,6 +265,34 @@ async def _inspect_manifest(raw_url: str, *, force: bool = False) -> dict[str, A
     return result
 
 
+def _database_diagnostics() -> dict[str, Any]:
+    """Read-only SQLite health check without mutating dashboard data."""
+    db_path = Path(settings.database_path)
+    result: dict[str, Any] = {
+        "ok": False,
+        "exists": db_path.exists(),
+        "path": str(db_path),
+        "size_bytes": db_path.stat().st_size if db_path.exists() else 0,
+    }
+
+    if not db_path.exists():
+        result["error"] = "Database file does not exist"
+        return result
+
+    try:
+        connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+        try:
+            integrity = connection.execute("PRAGMA quick_check").fetchone()
+            result["integrity"] = integrity[0] if integrity else "unknown"
+            result["ok"] = result["integrity"] == "ok"
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        result["error"] = f"{exc.__class__.__name__}: {exc}"
+
+    return result
+
+
 @app.get("/")
 @app.get("/dashboard")
 async def dashboard(request: Request):
@@ -435,6 +465,108 @@ async def server_status(request: Request):
             "subtitle_addons": len(saved.subtitle_addon_urls),
             "selected_catalogs": len(saved.selected_catalogs),
         },
+    }
+
+
+@app.get("/api/diagnostics")
+async def diagnostics(request: Request, force: bool = True):
+    """Run safe read-only diagnostics for the dashboard."""
+    if (denied := await _require(request)):
+        return denied
+
+    started = time.perf_counter()
+    saved = store.load()
+
+    entries: list[tuple[str, int, str]] = []
+    for index, url in enumerate(saved.stream_addon_urls):
+        entries.append(("stream", index, url))
+    for index, url in enumerate(saved.subtitle_addon_urls):
+        entries.append(("subtitle", index, url))
+
+    manifest_results = await asyncio.gather(
+        *(_inspect_manifest(url, force=force) for _, _, url in entries),
+        return_exceptions=True,
+    ) if entries else []
+
+    addon_rows: list[dict[str, Any]] = []
+    for (kind, index, url), raw in zip(entries, manifest_results):
+        if isinstance(raw, Exception):
+            item: dict[str, Any] = {
+                "ok": False,
+                "online": False,
+                "url": url,
+                "error": raw.__class__.__name__,
+            }
+        else:
+            item = dict(raw)
+
+        item = _validate_addon_kind(item, kind)
+        addon_rows.append({
+            "kind": kind,
+            "priority": index + 1,
+            "name": item.get("name") or urlparse(url).netloc or url,
+            "url": item.get("url") or url,
+            "online": bool(item.get("online")),
+            "valid_manifest": bool(item.get("ok")),
+            "compatible": bool(item.get("compatible")),
+            "latency_ms": item.get("latency_ms"),
+            "error": item.get("compatibility_error") or item.get("error"),
+        })
+
+    online = sum(1 for item in addon_rows if item["online"])
+    invalid = sum(1 for item in addon_rows if not item["valid_manifest"])
+    incompatible = sum(
+        1 for item in addon_rows
+        if item["valid_manifest"] and not item["compatible"]
+    )
+
+    database = _database_diagnostics()
+    jellyfin_api = {
+        "ok": True,
+        "product": "Stremfin",
+        "server_name": settings.server_name,
+        "server_id": settings.server_id,
+        "version": settings.app_version,
+        "public_info_endpoint": "/System/Info/Public",
+        "emby_public_info_endpoint": "/emby/System/Info/Public",
+        "authentication_endpoint": "/Users/AuthenticateByName",
+    }
+
+    overall_ok = bool(database.get("ok")) and invalid == 0 and incompatible == 0
+
+    return {
+        "ok": overall_ok,
+        "status": "healthy" if overall_ok else "attention",
+        "service": {
+            "name": settings.app_name,
+            "version": settings.app_version,
+            "server_name": settings.server_name,
+            "server_id": settings.server_id,
+            "public_base_url": settings.public_base_url,
+            "process_id": os.getpid(),
+        },
+        "jellyfin_emby_api": jellyfin_api,
+        "database": database,
+        "addons": {
+            "total": len(addon_rows),
+            "online": online,
+            "offline": len(addon_rows) - online,
+            "invalid": invalid,
+            "incompatible": incompatible,
+            "stream": len(saved.stream_addon_urls),
+            "subtitle": len(saved.subtitle_addon_urls),
+            "items": addon_rows,
+        },
+        "catalogs": {
+            "selected": len(saved.selected_catalogs),
+        },
+        "checks": {
+            "database": bool(database.get("ok")),
+            "jellyfin_emby_api": True,
+            "addons_valid": invalid == 0,
+            "addons_compatible": incompatible == 0,
+        },
+        "duration_ms": round((time.perf_counter() - started) * 1000),
     }
 
 

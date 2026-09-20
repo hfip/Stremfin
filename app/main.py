@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sqlite3
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 
 from app.api.jellyfin import router as jellyfin_router
 from app.config import get_settings
@@ -288,6 +290,41 @@ async def _inspect_manifest(raw_url: str, *, force: bool = False) -> dict[str, A
     return result
 
 
+_BACKUP_FORMAT = "stremfin-settings-backup"
+_BACKUP_SCHEMA_VERSION = 1
+
+
+def _backup_document(saved: AppSettings) -> dict[str, Any]:
+    """Create a portable settings-only backup. Server secrets are intentionally excluded."""
+    return {
+        "format": _BACKUP_FORMAT,
+        "schema_version": _BACKUP_SCHEMA_VERSION,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "stremfin_version": settings.app_version,
+        "settings": saved.model_dump(),
+    }
+
+
+def _parse_backup_document(payload: Any) -> AppSettings:
+    """Validate a Stremfin backup before writing anything to SQLite."""
+    if not isinstance(payload, dict):
+        raise ValueError("Backup must be a JSON object")
+    if payload.get("format") != _BACKUP_FORMAT:
+        raise ValueError("Unsupported backup format")
+    if payload.get("schema_version") != _BACKUP_SCHEMA_VERSION:
+        raise ValueError("Unsupported backup schema version")
+
+    raw_settings = payload.get("settings")
+    if not isinstance(raw_settings, dict):
+        raise ValueError("Backup does not contain settings")
+
+    # Only fields owned by AppSettings are restored. Dashboard/server credentials
+    # and other .env-level secrets are never imported through this endpoint.
+    allowed = set(AppSettings.model_fields)
+    cleaned = {key: value for key, value in raw_settings.items() if key in allowed}
+    return AppSettings.model_validate(cleaned)
+
+
 def _database_diagnostics() -> dict[str, Any]:
     """Read-only SQLite health check without mutating dashboard data."""
     db_path = Path(settings.database_path)
@@ -378,6 +415,51 @@ async def save_dashboard_settings(request: Request, payload: AppSettings):
     if (denied := await _require(request)):
         return denied
     return store.save(payload)
+
+
+@app.get("/api/settings/backup")
+async def backup_dashboard_settings(request: Request):
+    """Download a portable JSON backup of dashboard-managed settings."""
+    if (denied := await _require(request)):
+        return denied
+
+    document = _backup_document(store.load())
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    filename = f"stremfin-backup-{stamp}.json"
+    body = json.dumps(document, ensure_ascii=False, indent=2)
+
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.post("/api/settings/restore", response_model=AppSettings)
+async def restore_dashboard_settings(request: Request):
+    """Validate and restore a Stremfin settings backup atomically."""
+    if (denied := await _require(request)):
+        return denied
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"detail": "Backup is not valid JSON"}, status_code=400)
+
+    try:
+        restored = _parse_backup_document(payload)
+    except Exception as exc:
+        return JSONResponse(
+            {"detail": f"Invalid Stremfin backup: {exc}"},
+            status_code=400,
+        )
+
+    saved = store.save(restored)
+    _manifest_cache.clear()
+    return saved
 
 
 @app.get("/api/addons/inspect")

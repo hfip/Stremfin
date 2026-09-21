@@ -70,14 +70,8 @@ class AsyncTTLCache:
         self.ttl_seconds = max(1, int(ttl_seconds))
         self.maxsize = max(1, int(maxsize))
         self.stale_seconds = max(0, int(stale_seconds))
-        self.persistent_path = (
-            str(persistent_path).strip()
-            if persistent_path
-            else None
-        )
-        self.persistent_namespace = str(
-            persistent_namespace or "default"
-        ).strip() or "default"
+        self.persistent_path = str(persistent_path).strip() if persistent_path else None
+        self.persistent_namespace = str(persistent_namespace or "default").strip() or "default"
         self._persistent_ready = False
         self._persistent_init_lock = asyncio.Lock()
 
@@ -166,42 +160,30 @@ class AsyncTTLCache:
             else:
                 expired_entry = None
 
-        # L2 persistent cache: after a process/container restart the RAM cache
-        # is empty, but recently cached metadata can be restored from SQLite
-        # without contacting the Stremio addon again.
-        persistent = await self._persistent_get(cache_key)
-
-        if persistent is not None:
-            value, remaining_fresh, remaining_stale = persistent
-            async with self._lock:
-                self._store_locked(
-                    cache_key,
-                    value,
-                    fresh_seconds=remaining_fresh,
-                    stale_seconds=remaining_stale,
-                )
-                restored = self._items.get(cache_key)
-                if restored is not None:
-                    if restored.fresh_until > time.monotonic():
-                        self._hits += 1
-                    else:
-                        self._stale_hits += 1
-                        self._schedule_refresh_locked(
-                            cache_key,
-                            loader,
-                        )
-            return value
-
-        async with self._lock:
-            self._misses += 1
-
             key_lock = self._key_locks.get(cache_key)
-
             if key_lock is None:
                 key_lock = asyncio.Lock()
                 self._key_locks[cache_key] = key_lock
 
         async with key_lock:
+            # A RAM miss may still be a warm hit in the persistent SQLite L2.
+            # Check it only after acquiring the per-key lock so concurrent
+            # requests do not all hit SQLite for the same key.
+            persistent = await self._persistent_get(cache_key)
+            if persistent is not None:
+                value, fresh_for, stale_for = persistent
+                async with self._lock:
+                    self._store_locked(cache_key, value, fresh_for, stale_for)
+                    if fresh_for > 0:
+                        self._hits += 1
+                    else:
+                        self._stale_hits += 1
+                        self._schedule_refresh_locked(cache_key, loader)
+                    self._cleanup_key_lock_locked(cache_key, key_lock)
+                return value
+
+            async with self._lock:
+                self._misses += 1
             # Another request may have populated the key while this request
             # was waiting for the per-key lock.
             now = time.monotonic()
@@ -271,11 +253,7 @@ class AsyncTTLCache:
                     key_lock,
                 )
 
-            await self._persistent_set(
-                cache_key,
-                value,
-            )
-
+            await self._persistent_set(cache_key, value)
             return value
 
     async def get(
@@ -283,51 +261,34 @@ class AsyncTTLCache:
         key: str,
         allow_stale: bool = True,
     ) -> Any | None:
-        """
-        Read a value without invoking a loader.
-
-        Primarily useful for future prewarming and diagnostics.
-        """
-
+        """Read a value without invoking a loader."""
         cache_key = str(key)
         now = time.monotonic()
-
         async with self._lock:
             entry = self._items.get(cache_key)
-
-            if entry is None:
-                pass
-            elif entry.fresh_until > now:
-                entry.last_accessed_at = now
-                self._items.move_to_end(cache_key)
-                self._hits += 1
-                return entry.value
-
-            elif allow_stale and entry.stale_until > now:
-                entry.last_accessed_at = now
-                self._items.move_to_end(cache_key)
-                self._stale_hits += 1
-                return entry.value
-
-            elif entry is not None and entry.stale_until <= now:
-                self._items.pop(cache_key, None)
+            if entry is not None:
+                if entry.fresh_until > now:
+                    entry.last_accessed_at = now
+                    self._items.move_to_end(cache_key)
+                    self._hits += 1
+                    return entry.value
+                if allow_stale and entry.stale_until > now:
+                    entry.last_accessed_at = now
+                    self._items.move_to_end(cache_key)
+                    self._stale_hits += 1
+                    return entry.value
+                if entry.stale_until <= now:
+                    self._items.pop(cache_key, None)
 
         persistent = await self._persistent_get(cache_key)
         if persistent is None:
             return None
-
-        value, remaining_fresh, remaining_stale = persistent
-        if not allow_stale and remaining_fresh <= 0:
+        value, fresh_for, stale_for = persistent
+        if not allow_stale and fresh_for <= 0:
             return None
-
         async with self._lock:
-            self._store_locked(
-                cache_key,
-                value,
-                fresh_seconds=remaining_fresh,
-                stale_seconds=remaining_stale,
-            )
-            if remaining_fresh > 0:
+            self._store_locked(cache_key, value, fresh_for, stale_for)
+            if fresh_for > 0:
                 self._hits += 1
             else:
                 self._stale_hits += 1
@@ -350,40 +311,20 @@ class AsyncTTLCache:
                 cache_key,
                 value,
             )
-
-        await self._persistent_set(
-            cache_key,
-            value,
-        )
+        await self._persistent_set(cache_key, value)
 
     async def invalidate(
         self,
         key: str,
     ) -> bool:
-        """
-        Remove one cache key.
-
-        Returns True if the key existed.
-        """
-
+        """Remove one key from RAM and persistent storage."""
         cache_key = str(key)
-
         async with self._lock:
             existed = cache_key in self._items
-
-            self._items.pop(
-                cache_key,
-                None,
-            )
-
-            task = self._refresh_tasks.pop(
-                cache_key,
-                None,
-            )
-
+            self._items.pop(cache_key, None)
+            task = self._refresh_tasks.pop(cache_key, None)
             if task is not None and not task.done():
                 task.cancel()
-
         persistent_existed = await self._persistent_delete(cache_key)
         return existed or persistent_existed
 
@@ -391,39 +332,17 @@ class AsyncTTLCache:
         self,
         prefix: str,
     ) -> int:
-        """
-        Remove every key beginning with prefix.
-
-        Useful when addon configuration or selected catalogs change.
-        """
-
+        """Remove every key beginning with prefix from both cache layers."""
         value = str(prefix)
-
         async with self._lock:
-            keys = [
-                key
-                for key in self._items
-                if key.startswith(value)
-            ]
-
+            keys = [key for key in self._items if key.startswith(value)]
             for key in keys:
-                self._items.pop(
-                    key,
-                    None,
-                )
-
-                task = self._refresh_tasks.pop(
-                    key,
-                    None,
-                )
-
+                self._items.pop(key, None)
+                task = self._refresh_tasks.pop(key, None)
                 if task is not None and not task.done():
                     task.cancel()
-
-            memory_count = len(keys)
-
         persistent_count = await self._persistent_delete_prefix(value)
-        return max(memory_count, persistent_count)
+        return max(len(keys), persistent_count)
 
     async def clear(self) -> None:
         """Clear all cached values and cancel background refreshes."""
@@ -440,7 +359,6 @@ class AsyncTTLCache:
         for task in tasks:
             if not task.done():
                 task.cancel()
-
         await self._persistent_clear()
 
     async def stats(self) -> dict[str, int]:
@@ -536,11 +454,7 @@ class AsyncTTLCache:
                     key,
                     value,
                 )
-
-            await self._persistent_set(
-                key,
-                value,
-            )
+            await self._persistent_set(key, value)
 
         finally:
             async with self._lock:
@@ -574,17 +488,8 @@ class AsyncTTLCache:
 
         now = time.monotonic()
 
-        fresh_for = (
-            self.ttl_seconds
-            if fresh_seconds is None
-            else max(0.0, float(fresh_seconds))
-        )
-        stale_for = (
-            self.stale_seconds
-            if stale_seconds is None
-            else max(0.0, float(stale_seconds))
-        )
-
+        fresh_for = self.ttl_seconds if fresh_seconds is None else max(0.0, float(fresh_seconds))
+        stale_for = self.stale_seconds if stale_seconds is None else max(0.0, float(stale_seconds))
         fresh_until = now + fresh_for
         stale_until = fresh_until + stale_for
 
@@ -617,7 +522,7 @@ class AsyncTTLCache:
                 refresh_task.cancel()
 
     # ------------------------------------------------------------------
-    # Persistent L2 SQLite cache
+    # Persistent SQLite L2 cache
     # ------------------------------------------------------------------
 
     async def _ensure_persistent_ready(self) -> bool:
@@ -625,221 +530,106 @@ class AsyncTTLCache:
             return False
         if self._persistent_ready:
             return True
-
         async with self._persistent_init_lock:
             if self._persistent_ready:
                 return True
             try:
                 await asyncio.to_thread(self._persistent_init_sync)
             except Exception:
-                # Persistence is an optimization only. Never make browsing
-                # fail because SQLite is unavailable or temporarily locked.
                 return False
             self._persistent_ready = True
             return True
 
     def _persistent_connect_sync(self) -> sqlite3.Connection:
-        path = str(self.persistent_path)
-        parent = os.path.dirname(os.path.abspath(path))
-        if parent:
-            os.makedirs(parent, exist_ok=True)
+        path = os.path.abspath(str(self.persistent_path))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         db = sqlite3.connect(path, timeout=5.0)
         db.execute("PRAGMA busy_timeout=5000")
         return db
 
     def _persistent_init_sync(self) -> None:
         with self._persistent_connect_sync() as db:
-            db.execute(
-                """
-                CREATE TABLE IF NOT EXISTS async_cache_entries (
-                    namespace TEXT NOT NULL,
-                    cache_key TEXT NOT NULL,
-                    value_json TEXT NOT NULL,
-                    fresh_until REAL NOT NULL,
-                    stale_until REAL NOT NULL,
-                    updated_at REAL NOT NULL,
-                    PRIMARY KEY(namespace, cache_key)
-                )
-                """
-            )
-            db.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_async_cache_expiry
-                ON async_cache_entries(namespace, stale_until)
-                """
-            )
+            db.execute("""CREATE TABLE IF NOT EXISTS async_cache_entries (
+                namespace TEXT NOT NULL, cache_key TEXT NOT NULL, value_json TEXT NOT NULL,
+                fresh_until REAL NOT NULL, stale_until REAL NOT NULL, updated_at REAL NOT NULL,
+                PRIMARY KEY(namespace, cache_key))""")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_async_cache_expiry ON async_cache_entries(namespace, stale_until)")
 
-    async def _persistent_get(
-        self,
-        key: str,
-    ) -> tuple[Any, float, float] | None:
+    async def _persistent_get(self, key: str) -> tuple[Any, float, float] | None:
         if not await self._ensure_persistent_ready():
             return None
         try:
-            return await asyncio.to_thread(
-                self._persistent_get_sync,
-                key,
-            )
+            return await asyncio.to_thread(self._persistent_get_sync, key)
         except Exception:
             return None
 
-    def _persistent_get_sync(
-        self,
-        key: str,
-    ) -> tuple[Any, float, float] | None:
+    def _persistent_get_sync(self, key: str) -> tuple[Any, float, float] | None:
         now = time.time()
         with self._persistent_connect_sync() as db:
-            row = db.execute(
-                """
-                SELECT value_json, fresh_until, stale_until
-                FROM async_cache_entries
-                WHERE namespace = ? AND cache_key = ?
-                """,
-                (self.persistent_namespace, key),
-            ).fetchone()
-
+            row = db.execute("SELECT value_json, fresh_until, stale_until FROM async_cache_entries WHERE namespace=? AND cache_key=?", (self.persistent_namespace, key)).fetchone()
             if row is None:
                 return None
-
             value_json, fresh_until, stale_until = row
             if float(stale_until) <= now:
-                db.execute(
-                    """
-                    DELETE FROM async_cache_entries
-                    WHERE namespace = ? AND cache_key = ?
-                    """,
-                    (self.persistent_namespace, key),
-                )
+                db.execute("DELETE FROM async_cache_entries WHERE namespace=? AND cache_key=?", (self.persistent_namespace, key))
                 return None
-
             try:
                 value = json.loads(value_json)
             except (TypeError, ValueError, json.JSONDecodeError):
-                db.execute(
-                    """
-                    DELETE FROM async_cache_entries
-                    WHERE namespace = ? AND cache_key = ?
-                    """,
-                    (self.persistent_namespace, key),
-                )
+                db.execute("DELETE FROM async_cache_entries WHERE namespace=? AND cache_key=?", (self.persistent_namespace, key))
                 return None
+            fresh_for = max(0.0, float(fresh_until) - now)
+            total_for = max(0.0, float(stale_until) - now)
+            stale_for = max(0.0, total_for - fresh_for)
+            return value, fresh_for, stale_for
 
-            remaining_fresh = max(0.0, float(fresh_until) - now)
-            remaining_total = max(0.0, float(stale_until) - now)
-            remaining_stale = max(
-                0.0,
-                remaining_total - remaining_fresh,
-            )
-            return value, remaining_fresh, remaining_stale
-
-    async def _persistent_set(
-        self,
-        key: str,
-        value: Any,
-    ) -> None:
+    async def _persistent_set(self, key: str, value: Any) -> None:
         if not await self._ensure_persistent_ready():
             return
         try:
-            value_json = json.dumps(
-                value,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-        except (TypeError, ValueError):
-            return
-        try:
-            await asyncio.to_thread(
-                self._persistent_set_sync,
-                key,
-                value_json,
-            )
-        except Exception:
+            payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            await asyncio.to_thread(self._persistent_set_sync, key, payload)
+        except (TypeError, ValueError, sqlite3.Error, OSError):
             return
 
-    def _persistent_set_sync(
-        self,
-        key: str,
-        value_json: str,
-    ) -> None:
+    def _persistent_set_sync(self, key: str, payload: str) -> None:
         now = time.time()
         fresh_until = now + self.ttl_seconds
         stale_until = fresh_until + self.stale_seconds
         with self._persistent_connect_sync() as db:
-            db.execute(
-                """
-                INSERT INTO async_cache_entries(
-                    namespace,
-                    cache_key,
-                    value_json,
-                    fresh_until,
-                    stale_until,
-                    updated_at
-                )
-                VALUES(?, ?, ?, ?, ?, ?)
-                ON CONFLICT(namespace, cache_key)
-                DO UPDATE SET
-                    value_json = excluded.value_json,
-                    fresh_until = excluded.fresh_until,
-                    stale_until = excluded.stale_until,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    self.persistent_namespace,
-                    key,
-                    value_json,
-                    fresh_until,
-                    stale_until,
-                    now,
-                ),
-            )
+            db.execute("""INSERT INTO async_cache_entries(namespace,cache_key,value_json,fresh_until,stale_until,updated_at)
+                VALUES(?,?,?,?,?,?) ON CONFLICT(namespace,cache_key) DO UPDATE SET
+                value_json=excluded.value_json,fresh_until=excluded.fresh_until,stale_until=excluded.stale_until,updated_at=excluded.updated_at""",
+                (self.persistent_namespace,key,payload,fresh_until,stale_until,now))
 
     async def _persistent_delete(self, key: str) -> bool:
         if not await self._ensure_persistent_ready():
             return False
         try:
-            return bool(
-                await asyncio.to_thread(
-                    self._persistent_delete_sync,
-                    key,
-                )
-            )
+            return bool(await asyncio.to_thread(self._persistent_delete_sync, key))
         except Exception:
             return False
 
     def _persistent_delete_sync(self, key: str) -> int:
         with self._persistent_connect_sync() as db:
-            cursor = db.execute(
-                """
-                DELETE FROM async_cache_entries
-                WHERE namespace = ? AND cache_key = ?
-                """,
-                (self.persistent_namespace, key),
-            )
-            return int(cursor.rowcount or 0)
+            cur=db.execute("DELETE FROM async_cache_entries WHERE namespace=? AND cache_key=?", (self.persistent_namespace,key))
+            return int(cur.rowcount or 0)
 
     async def _persistent_delete_prefix(self, prefix: str) -> int:
         if not await self._ensure_persistent_ready():
             return 0
         try:
-            return int(
-                await asyncio.to_thread(
-                    self._persistent_delete_prefix_sync,
-                    prefix,
-                )
-            )
+            return int(await asyncio.to_thread(self._persistent_delete_prefix_sync, prefix))
         except Exception:
             return 0
 
     def _persistent_delete_prefix_sync(self, prefix: str) -> int:
         with self._persistent_connect_sync() as db:
-            cursor = db.execute(
-                """
-                DELETE FROM async_cache_entries
-                WHERE namespace = ? AND cache_key LIKE ?
-                """,
-                (self.persistent_namespace, f"{prefix}%"),
+            cur = db.execute(
+                "DELETE FROM async_cache_entries WHERE namespace=? AND substr(cache_key,1,length(?))=?",
+                (self.persistent_namespace, prefix, prefix),
             )
-            return int(cursor.rowcount or 0)
+            return int(cur.rowcount or 0)
 
     async def _persistent_clear(self) -> None:
         if not await self._ensure_persistent_ready():
@@ -851,13 +641,7 @@ class AsyncTTLCache:
 
     def _persistent_clear_sync(self) -> None:
         with self._persistent_connect_sync() as db:
-            db.execute(
-                """
-                DELETE FROM async_cache_entries
-                WHERE namespace = ?
-                """,
-                (self.persistent_namespace,),
-            )
+            db.execute("DELETE FROM async_cache_entries WHERE namespace=?", (self.persistent_namespace,))
 
     def _cleanup_key_lock_locked(
         self,
@@ -900,9 +684,6 @@ metadata_cache = AsyncTTLCache(
     ttl_seconds=1800,
     stale_seconds=3600,
     maxsize=1024,
-    persistent_path=os.getenv(
-        "DATABASE_PATH",
-        "./data/stremfin.db",
-    ),
+    persistent_path=os.getenv("DATABASE_PATH", "./data/stremfin.db"),
     persistent_namespace="metadata",
 )

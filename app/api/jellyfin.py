@@ -550,6 +550,12 @@ def _episode_dto(
     if not name:
         name = f"Episode {episode}"
 
+    thumbnail = str(video.get("thumbnail") or "").strip()
+    if thumbnail:
+        _ARTWORK_CACHE[str(episode_id)] = {"poster": thumbnail}
+        while len(_ARTWORK_CACHE) > _ARTWORK_CACHE_MAXSIZE:
+            _ARTWORK_CACHE.pop(next(iter(_ARTWORK_CACHE)), None)
+
     return {
         "Name": name,
         "OriginalTitle": name,
@@ -592,7 +598,26 @@ def _episode_dto(
         "CanDelete": False,
         "CanDownload": True,
         "PlayAccess": "Full",
-        "ImageTags": {},
+        "ImageTags": (
+            {"Primary": "live"}
+            if thumbnail
+            else {}
+        ),
+        "PrimaryImageTag": (
+            "live"
+            if thumbnail
+            else None
+        ),
+        "ImageSources": (
+            [
+                {
+                    "Type": "Primary",
+                    "Url": f"/Items/{episode_id}/Images/Primary",
+                }
+            ]
+            if thumbnail
+            else []
+        ),
         "BackdropImageTags": [],
         "ProviderIds": {},
         "UserData": _userdata(),

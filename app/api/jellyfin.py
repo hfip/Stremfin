@@ -37,6 +37,11 @@ MAX_PAGE_SIZE = 100
 MAX_CATALOG_WINDOW = 500
 DEFAULT_PAGE_SIZE = 20
 
+# Catalog metadata already contains artwork URLs. Cache those URLs so image
+# requests do not repeat slow metadata lookups.
+_ARTWORK_CACHE: dict[str, dict[str, str]] = {}
+_ARTWORK_CACHE_MAXSIZE = 5000
+
 _EPISODE_ID_RE = re.compile(r"^(?P<series>.+):s(?P<season>\d+)e(?P<episode>\d+)$")
 _SEASON_ID_RE = re.compile(r"^(?P<series>.+):s(?P<season>\d+)$")
 
@@ -337,6 +342,19 @@ def _item(meta: dict[str, Any], collection: str) -> dict[str, Any]:
     is_series = raw_type == "series"
     display_name = _display_name(meta)
 
+    artwork: dict[str, str] = {}
+    if meta.get("poster"):
+        artwork["poster"] = str(meta["poster"])
+    if meta.get("backdrop"):
+        artwork["backdrop"] = str(meta["backdrop"])
+    cached_logo_url = _logo_url(meta)
+    if cached_logo_url:
+        artwork["logo"] = cached_logo_url
+    if artwork:
+        _ARTWORK_CACHE[str(item_id)] = artwork
+        while len(_ARTWORK_CACHE) > _ARTWORK_CACHE_MAXSIZE:
+            _ARTWORK_CACHE.pop(next(iter(_ARTWORK_CACHE)), None)
+
     dto: dict[str, Any] = {
         "Name": display_name,
         "OriginalTitle": display_name,
@@ -412,7 +430,7 @@ def _item(meta: dict[str, Any], collection: str) -> dict[str, Any]:
             }
         )
 
-    logo_url = _logo_url(meta)
+    logo_url = cached_logo_url
 
     if logo_url:
         image_tags = dict(dto.get("ImageTags") or {})
@@ -2233,16 +2251,8 @@ async def get_item(
         collection,
     )
 
-    # Keep individual item browsing lightweight.
-    #
-    # Resolving Stremio streams and subtitle addons here makes simply opening
-    # a Movie details page wait for every playback-related network request.
-    # Jellyfin/Emby clients already request PlaybackInfo when playback data is
-    # actually needed, and that endpoint remains the authoritative place for
-    # stream/subtitle resolution.
-    #
-    # Series browsing was already lightweight; Movies now follow the same
-    # rule so metadata/artwork can render without waiting for playback addons.
+    # Keep individual item browsing lightweight. PlaybackInfo remains the
+    # authoritative place for stream/subtitle resolution.
     return dto
 
 
@@ -2432,6 +2442,14 @@ async def episodes(
 @router.get("/emby/Items/{item_id}/Images/Primary")
 @router.get("/Items/{item_id}/Images/Primary")
 async def primary_image(item_id: str):
+    cached = _ARTWORK_CACHE.get(str(item_id))
+    if cached and cached.get("poster"):
+        return RedirectResponse(
+            cached["poster"],
+            status_code=302,
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
     _, meta = await _lookup(item_id)
 
     if not meta:
@@ -2466,6 +2484,14 @@ async def primary_image(item_id: str):
 @router.get("/emby/Items/{item_id}/Images/Logo")
 @router.get("/Items/{item_id}/Images/Logo")
 async def logo_image(item_id: str):
+    cached = _ARTWORK_CACHE.get(str(item_id))
+    if cached and cached.get("logo"):
+        return RedirectResponse(
+            cached["logo"],
+            status_code=302,
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
     _, meta = await _lookup(item_id)
 
     if not meta:
@@ -2501,6 +2527,14 @@ async def logo_image(item_id: str):
 @router.get("/emby/Items/{item_id}/Images/Backdrop")
 @router.get("/Items/{item_id}/Images/Backdrop")
 async def backdrop_image(item_id: str):
+    cached = _ARTWORK_CACHE.get(str(item_id))
+    if cached and cached.get("backdrop"):
+        return RedirectResponse(
+            cached["backdrop"],
+            status_code=302,
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
     _, meta = await _lookup(item_id)
 
     if not meta:

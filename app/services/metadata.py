@@ -437,23 +437,47 @@ class MetadataService:
                 ),
             )
 
-        # Start metadata lookups concurrently so one slow or unavailable addon
-        # cannot serially delay every addon that follows it. asyncio.gather()
-        # preserves the original addon order in its result list, so Stremfin
-        # still returns the first successful metadata result according to the
-        # configured source priority.
-        results = await asyncio.gather(
-            *(load_from_addon(base_url) for base_url in clean_addons),
-            return_exceptions=True,
-        )
+        # Start all metadata lookups concurrently, but do not wait for every
+        # addon before returning. Some addons can take the full global timeout
+        # even when another addon has already returned valid metadata.
+        tasks = [
+            asyncio.create_task(load_from_addon(base_url))
+            for base_url in clean_addons
+        ]
 
-        for result in results:
-            if isinstance(result, BaseException):
-                continue
-            if result:
-                return result
+        try:
+            for completed in asyncio.as_completed(tasks):
+                try:
+                    result = await completed
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    continue
 
-        return None
+                if result:
+                    # The first valid metadata response is enough for browsing.
+                    # Let unfinished cache-backed tasks continue briefly in the
+                    # background so their results can still warm metadata_cache.
+                    for task in tasks:
+                        if not task.done():
+                            task.add_done_callback(
+                                lambda finished: (
+                                    finished.exception()
+                                    if not finished.cancelled()
+                                    else None
+                                )
+                            )
+                    return result
+
+            return None
+        finally:
+            # If this request itself is cancelled (client disconnect/shutdown),
+            # do not leave orphaned network work behind.
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
 
     async def _fetch_details(
         self,

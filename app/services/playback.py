@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -18,9 +19,14 @@ from app.services.stremio import StreamCandidate, StremioResolver
 # Item details and PlaybackInfo intentionally share this cache.  Infuse can
 # therefore receive the same source set before and after pressing Play.
 playback_cache = AsyncTTLCache(
-    ttl_seconds=300,
-    stale_seconds=600,
+    ttl_seconds=3600,
+    stale_seconds=300,
     maxsize=1024,
+    persistent_path=os.getenv(
+        "DATABASE_PATH",
+        "./data/stremfin.db",
+    ),
+    persistent_namespace="playback",
 )
 
 
@@ -78,14 +84,15 @@ class PlaybackResolver:
         episode_number = self._safe_int(episode)
         cache_key = self._cache_key(content_id, season_number, episode_number)
 
-        return await playback_cache.get_or_set(
+        cached = await playback_cache.get_or_set(
             cache_key,
-            lambda: self._resolve_uncached(
+            lambda: self._resolve_serializable(
                 content_id,
                 season_number,
                 episode_number,
             ),
         )
+        return self._deserialize_sources(cached)
 
     async def playback_info(
         self,
@@ -127,6 +134,75 @@ class PlaybackResolver:
                     return source.url
 
         return sources[0].url
+
+    async def _resolve_serializable(
+        self,
+        item_id: str,
+        season: int | None,
+        episode: int | None,
+    ) -> list[dict[str, Any]]:
+        """Resolve sources into JSON-safe dictionaries for RAM + SQLite cache."""
+        sources = await self._resolve_uncached(item_id, season, episode)
+        return [self._serialize_source(source) for source in sources]
+
+    @staticmethod
+    def _serialize_source(source: ResolvedMediaSource) -> dict[str, Any]:
+        return {
+            "id": source.id,
+            "item_id": source.item_id,
+            "url": source.url,
+            "name": source.name,
+            "container": source.container,
+            "protocol": source.protocol,
+            "source_type": source.source_type,
+            "addon_name": source.addon_name,
+            "addon_url": source.addon_url,
+            "quality": source.quality,
+            "release_type": source.release_type,
+            "bitrate": source.bitrate,
+            "width": source.width,
+            "height": source.height,
+            "video_codec": source.video_codec,
+            "audio_codec": source.audio_codec,
+            "behavior_hints": source.behavior_hints,
+        }
+
+    @staticmethod
+    def _deserialize_sources(value: Any) -> list[ResolvedMediaSource]:
+        if not isinstance(value, list):
+            return []
+
+        output: list[ResolvedMediaSource] = []
+        for raw in value:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                source = ResolvedMediaSource(
+                    id=str(raw.get("id") or ""),
+                    item_id=str(raw.get("item_id") or ""),
+                    url=str(raw.get("url") or ""),
+                    name=str(raw.get("name") or "Stremfin Source"),
+                    container=raw.get("container"),
+                    protocol=str(raw.get("protocol") or "Http"),
+                    source_type=str(raw.get("source_type") or "direct"),
+                    addon_name=raw.get("addon_name"),
+                    addon_url=raw.get("addon_url"),
+                    quality=raw.get("quality"),
+                    release_type=raw.get("release_type"),
+                    bitrate=raw.get("bitrate"),
+                    width=raw.get("width"),
+                    height=raw.get("height"),
+                    video_codec=raw.get("video_codec"),
+                    audio_codec=raw.get("audio_codec"),
+                    behavior_hints=raw.get("behavior_hints") if isinstance(raw.get("behavior_hints"), dict) else None,
+                )
+            except (TypeError, ValueError):
+                continue
+
+            if source.id and source.item_id and source.url:
+                output.append(source)
+
+        return output
 
     async def _resolve_uncached(
         self,

@@ -2251,8 +2251,22 @@ async def get_item(
         collection,
     )
 
-    # Keep individual item browsing lightweight. PlaybackInfo remains the
-    # authoritative place for stream/subtitle resolution.
+    # Preserve client compatibility: some Jellyfin/Emby-style clients read
+    # MediaSources and external subtitle streams directly from the individual
+    # Movie item DTO instead of requesting PlaybackInfo first.
+    if dto["Type"] == "Movie":
+        content_id = (
+            meta.get("id")
+            or meta.get("imdb_id")
+            or item_id
+        )
+
+        return await _attach_playback_media(
+            dto,
+            runtime,
+            str(content_id),
+        )
+
     return dto
 
 

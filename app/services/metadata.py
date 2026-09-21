@@ -423,9 +423,12 @@ class MetadataService:
             if base_url and base_url not in clean_addons:
                 clean_addons.append(base_url)
 
-        for base_url in clean_addons:
+        if not clean_addons:
+            return None
+
+        async def load_from_addon(base_url: str) -> dict | None:
             key = f"meta:{base_url}:{endpoint_type}:{item_id}"
-            result = await metadata_cache.get_or_set(
+            return await metadata_cache.get_or_set(
                 key,
                 lambda b=base_url: self._fetch_details(
                     b,
@@ -433,6 +436,20 @@ class MetadataService:
                     item_id,
                 ),
             )
+
+        # Start metadata lookups concurrently so one slow or unavailable addon
+        # cannot serially delay every addon that follows it. asyncio.gather()
+        # preserves the original addon order in its result list, so Stremfin
+        # still returns the first successful metadata result according to the
+        # configured source priority.
+        results = await asyncio.gather(
+            *(load_from_addon(base_url) for base_url in clean_addons),
+            return_exceptions=True,
+        )
+
+        for result in results:
+            if isinstance(result, BaseException):
+                continue
             if result:
                 return result
 

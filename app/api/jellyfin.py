@@ -2233,21 +2233,16 @@ async def get_item(
         collection,
     )
 
-    # Resolve real playback versions and subtitles only for an individual
-    # playable item. Catalog browsing remains network-light.
-    if dto["Type"] == "Movie":
-        content_id = (
-            meta.get("id")
-            or meta.get("imdb_id")
-            or item_id
-        )
-
-        return await _attach_playback_media(
-            dto,
-            runtime,
-            str(content_id),
-        )
-
+    # Keep individual item browsing lightweight.
+    #
+    # Resolving Stremio streams and subtitle addons here makes simply opening
+    # a Movie details page wait for every playback-related network request.
+    # Jellyfin/Emby clients already request PlaybackInfo when playback data is
+    # actually needed, and that endpoint remains the authoritative place for
+    # stream/subtitle resolution.
+    #
+    # Series browsing was already lightweight; Movies now follow the same
+    # rule so metadata/artwork can render without waiting for playback addons.
     return dto
 
 

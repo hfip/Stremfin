@@ -573,6 +573,27 @@ async def server_status(request: Request):
     }
 
 
+@app.get("/api/server/connection")
+async def server_connection(request: Request):
+    """Connection Wizard credentials for an authenticated dashboard session."""
+    if (denied := await _require(request)):
+        return denied
+
+    protected = bool(settings.client_auth_enabled)
+    response = JSONResponse(
+        {
+            "server_url": settings.public_base_url,
+            "client_auth_enabled": protected,
+            "username": str(settings.client_username or "").strip() or "stremfin",
+            "password": str(settings.client_password or "") if protected else "",
+            "password_required": protected and bool(str(settings.client_password or "")),
+        }
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
 @app.get("/api/diagnostics")
 async def diagnostics(request: Request, force: bool = True):
     """Run safe read-only diagnostics for the dashboard."""

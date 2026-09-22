@@ -2141,6 +2141,7 @@ def _next_series_video(
 @router.get("/Shows/NextUp")
 async def next_up(
     user_id: str | None = Query(None, alias="UserId"),
+    series_id: str | None = Query(None, alias="SeriesId"),
     start_index: int = Query(0, alias="StartIndex", ge=0),
     limit: int = Query(DEFAULT_PAGE_SIZE, alias="Limit", ge=1),
     settings: Settings = Depends(get_settings),
@@ -2169,11 +2170,21 @@ async def next_up(
         if not parts:
             continue
 
-        series_id, season_number, episode_number = parts
-        if series_id in latest_played_by_series:
+        state_series_id, season_number, episode_number = parts
+
+        # Jellyfin clients commonly call /Shows/NextUp with SeriesId when
+        # opening a series page. Keep that request strictly scoped to the
+        # requested series; otherwise watch history from another show can be
+        # returned as the single Limit=1 result and selected by the client as
+        # the default episode. An unwatched requested series therefore returns
+        # an empty Next Up result instead of borrowing another show's state.
+        if series_id and state_series_id != series_id:
             continue
 
-        latest_played_by_series[series_id] = (
+        if state_series_id in latest_played_by_series:
+            continue
+
+        latest_played_by_series[state_series_id] = (
             state,
             season_number,
             episode_number,

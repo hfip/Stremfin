@@ -13,14 +13,28 @@ from app.config import Settings
 from app.services.cache import AsyncTTLCache
 
 
-# Stream information changes more frequently than metadata/catalogs.
+# Two-level stream cache.
 #
-# Keep it fresh for five minutes, but allow an older result to be served
-# for another ten minutes while a slow addon refreshes in the background.
+# 1) addon_stream_cache stores each addon's result independently.  This lets
+#    Stremfin reuse already-resolved providers when the configured addon set or
+#    ordering changes, instead of scraping every provider again.
+#
+# 2) stream_cache stores the final merged result for the exact addon
+#    configuration.  It is intentionally shorter-lived than the provider cache.
+#
+# AsyncTTLCache already provides per-key request coalescing (single-flight), so
+# concurrent Jellyfin clients requesting the same provider/item share one
+# upstream request instead of starting duplicate scrapes.
+addon_stream_cache = AsyncTTLCache(
+    ttl_seconds=900,
+    stale_seconds=900,
+    maxsize=2048,
+)
+
 stream_cache = AsyncTTLCache(
-    ttl_seconds=300,
-    stale_seconds=600,
-    maxsize=512,
+    ttl_seconds=60,
+    stale_seconds=120,
+    maxsize=1024,
 )
 
 
@@ -167,11 +181,18 @@ class StremioResolver:
             follow_redirects=True,
         ) as client:
             tasks = [
-                self._resolve_addon(
-                    client=client,
-                    addon_url=addon_url,
-                    content_type=content_type,
-                    stream_id=stream_id,
+                addon_stream_cache.get_or_set(
+                    self._addon_cache_key(
+                        addon_url=addon_url,
+                        content_type=content_type,
+                        stream_id=stream_id,
+                    ),
+                    lambda addon_url=addon_url: self._resolve_addon(
+                        client=client,
+                        addon_url=addon_url,
+                        content_type=content_type,
+                        stream_id=stream_id,
+                    ),
                 )
                 for addon_url in addon_urls
             ]
@@ -643,6 +664,19 @@ class StremioResolver:
     # ------------------------------------------------------------------
     # Cache helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _addon_cache_key(
+        addon_url: str,
+        content_type: str,
+        stream_id: str,
+    ) -> str:
+        return (
+            "addon-streams:"
+            f"{addon_url}:"
+            f"{content_type}:"
+            f"{stream_id}"
+        )
 
     @staticmethod
     def _cache_key(

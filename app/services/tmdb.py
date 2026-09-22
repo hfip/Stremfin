@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from difflib import SequenceMatcher
 from typing import Any
 
 import httpx
@@ -177,6 +178,72 @@ class TMDBProvider:
             if results and isinstance(results[0], dict):
                 return kind, int(results[0]["id"])
         return None
+
+    async def search_id(
+        self,
+        title: str,
+        media_type: str,
+        year: int | None = None,
+        language: str = "en-US",
+        original_title: str | None = None,
+    ) -> tuple[str, int] | None:
+        """Resolve addon/private IDs conservatively using title + year."""
+        kind = "tv" if str(media_type).lower() in {"tv", "series"} else "movie"
+        queries: list[str] = []
+        for value in (title, original_title):
+            value = str(value or "").strip()
+            if value and value not in queries:
+                queries.append(value)
+        if not queries:
+            return None
+
+        def norm(value: Any) -> str:
+            return " ".join(re.findall(r"\w+", str(value or "").casefold(), flags=re.UNICODE))
+
+        best: tuple[float, int] | None = None
+        for query in queries:
+            params: dict[str, Any] = {
+                "query": query,
+                "language": normalize_language(language),
+                "include_adult": "false",
+            }
+            if year:
+                params["year" if kind == "movie" else "first_air_date_year"] = int(year)
+            data = await self._get(f"/search/{kind}", **params)
+            for item in ((data or {}).get("results") or [])[:8]:
+                if not isinstance(item, dict) or not item.get("id"):
+                    continue
+                title_key = "title" if kind == "movie" else "name"
+                original_key = "original_title" if kind == "movie" else "original_name"
+                wanted = norm(query)
+                title_score = max(
+                    SequenceMatcher(None, wanted, norm(item.get(title_key))).ratio(),
+                    SequenceMatcher(None, wanted, norm(item.get(original_key))).ratio(),
+                )
+                date_key = "release_date" if kind == "movie" else "first_air_date"
+                date = str(item.get(date_key) or "")
+                result_year = int(date[:4]) if len(date) >= 4 and date[:4].isdigit() else None
+                delta = abs(result_year - int(year)) if year and result_year else None
+                if title_score < 0.82 or (year and delta is not None and delta > 1):
+                    continue
+                score = title_score + (0.18 if delta == 0 else 0.08 if delta == 1 else 0.0)
+                if best is None or score > best[0]:
+                    best = (score, int(item["id"]))
+        return (kind, best[1]) if best else None
+
+    async def details_from_search(
+        self,
+        title: str,
+        media_type: str,
+        year: int | None = None,
+        language: str = "en-US",
+        original_title: str | None = None,
+    ) -> dict[str, Any] | None:
+        resolved = await self.search_id(title, media_type, year, language, original_title)
+        if resolved is None:
+            return None
+        kind, tmdb_id = resolved
+        return await self.details(tmdb_id, kind, language=language)
 
     async def details(
         self,

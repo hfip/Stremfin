@@ -20,6 +20,7 @@ class WatchState:
     position_ticks: int = 0
     runtime_ticks: int = 0
     media_source_id: str | None = None
+    subtitle_stream_index: int | None = None
     played: bool = False
     play_count: int = 0
     last_played_date: str | None = None
@@ -85,6 +86,7 @@ class WatchStateStore:
                     position_ticks INTEGER NOT NULL DEFAULT 0,
                     runtime_ticks INTEGER NOT NULL DEFAULT 0,
                     media_source_id TEXT,
+                    subtitle_stream_index INTEGER,
                     played INTEGER NOT NULL DEFAULT 0,
                     play_count INTEGER NOT NULL DEFAULT 0,
                     last_played_date TEXT,
@@ -100,6 +102,11 @@ class WatchStateStore:
             if "media_source_id" not in columns:
                 db.execute(
                     "ALTER TABLE watch_state ADD COLUMN media_source_id TEXT"
+                )
+            if "subtitle_stream_index" not in columns:
+                db.execute(
+                    "ALTER TABLE watch_state "
+                    "ADD COLUMN subtitle_stream_index INTEGER"
                 )
 
             db.execute(
@@ -121,6 +128,15 @@ class WatchStateStore:
             return 0
 
     @staticmethod
+    def _optional_int(value: Any) -> int | None:
+        if value is None or value == "":
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
     def _row_to_state(row: sqlite3.Row | None) -> WatchState | None:
         if row is None:
             return None
@@ -132,6 +148,11 @@ class WatchStateStore:
             media_source_id=(
                 str(row["media_source_id"])
                 if row["media_source_id"]
+                else None
+            ),
+            subtitle_stream_index=(
+                int(row["subtitle_stream_index"])
+                if row["subtitle_stream_index"] is not None
                 else None
             ),
             played=bool(row["played"]),
@@ -163,6 +184,7 @@ class WatchStateStore:
         position_ticks: Any,
         runtime_ticks: Any = 0,
         media_source_id: str | None = None,
+        subtitle_stream_index: Any = None,
     ) -> WatchState:
         await self.ensure_ready()
         return await asyncio.to_thread(
@@ -172,6 +194,7 @@ class WatchStateStore:
             self._clean_ticks(position_ticks),
             self._clean_ticks(runtime_ticks),
             str(media_source_id or "").strip() or None,
+            self._optional_int(subtitle_stream_index),
         )
 
     def _update_progress_sync(
@@ -181,6 +204,7 @@ class WatchStateStore:
         position_ticks: int,
         runtime_ticks: int,
         media_source_id: str | None,
+        subtitle_stream_index: int | None,
     ) -> WatchState:
         now = self._utc_now()
 
@@ -194,7 +218,8 @@ class WatchStateStore:
         with self._connect() as db:
             previous = db.execute(
                 """
-                SELECT played, play_count, runtime_ticks, media_source_id
+                SELECT played, play_count, runtime_ticks, media_source_id,
+                       subtitle_stream_index
                 FROM watch_state
                 WHERE user_id = ? AND item_id = ?
                 """,
@@ -217,6 +242,17 @@ class WatchStateStore:
             effective_media_source_id = (
                 media_source_id or previous_media_source_id
             )
+            previous_subtitle_stream_index = (
+                int(previous["subtitle_stream_index"])
+                if previous
+                and previous["subtitle_stream_index"] is not None
+                else None
+            )
+            effective_subtitle_stream_index = (
+                subtitle_stream_index
+                if subtitle_stream_index is not None
+                else previous_subtitle_stream_index
+            )
 
             if completed and not old_played:
                 play_count += 1
@@ -229,17 +265,19 @@ class WatchStateStore:
                     position_ticks,
                     runtime_ticks,
                     media_source_id,
+                    subtitle_stream_index,
                     played,
                     play_count,
                     last_played_date,
                     updated_at
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(user_id, item_id)
                 DO UPDATE SET
                     position_ticks = excluded.position_ticks,
                     runtime_ticks = excluded.runtime_ticks,
                     media_source_id = excluded.media_source_id,
+                    subtitle_stream_index = excluded.subtitle_stream_index,
                     played = excluded.played,
                     play_count = excluded.play_count,
                     last_played_date = excluded.last_played_date,
@@ -251,6 +289,7 @@ class WatchStateStore:
                     stored_position,
                     effective_runtime,
                     effective_media_source_id,
+                    effective_subtitle_stream_index,
                     int(completed),
                     play_count,
                     now,

@@ -10,6 +10,7 @@ import httpx
 
 from app.config import Settings
 from app.services.cache import metadata_cache
+from app.services.tmdb import TMDBProvider, normalize_language
 
 
 class MetadataService:
@@ -27,6 +28,11 @@ class MetadataService:
 
     def __init__(self, settings: Settings):
         self.settings = settings
+        self.tmdb = TMDBProvider(
+            api_key=settings.tmdb_api_key,
+            access_token=settings.tmdb_access_token,
+            timeout_seconds=settings.request_timeout_seconds,
+        )
 
     @staticmethod
     def _base_url(addon_url: str) -> str:
@@ -411,12 +417,58 @@ class MetadataService:
         item_id: str,
         kind: str,
         addon_urls: list[str],
+        language: str | None = None,
     ) -> dict | None:
         endpoint_type = "series" if kind in ("series", "tv") else "movie"
         item_id = str(item_id or "").strip()
         if not item_id:
             return None
 
+        requested_language = normalize_language(
+            language,
+            default=self.settings.tmdb_default_language,
+        )
+
+        if self.settings.tmdb_enabled:
+            tmdb_key = (
+                "tmdb-meta:"
+                f"{requested_language}:"
+                f"{endpoint_type}:"
+                f"{item_id}"
+            )
+            tmdb_result = await metadata_cache.get_or_set(
+                tmdb_key,
+                lambda: self._tmdb_details(
+                    item_id,
+                    endpoint_type,
+                    requested_language,
+                ),
+            )
+            if tmdb_result:
+                # For series, preserve Stremio's videos list because Seasons
+                # and Next Up currently depend on that topology.
+                if endpoint_type == "series":
+                    stremio = await self._stremio_details(
+                        item_id,
+                        endpoint_type,
+                        addon_urls,
+                    )
+                    if stremio:
+                        tmdb_result["videos"] = stremio.get("videos") or []
+                return tmdb_result
+
+        return await self._stremio_details(
+            item_id,
+            endpoint_type,
+            addon_urls,
+        )
+
+    async def _stremio_details(
+        self,
+        item_id: str,
+        endpoint_type: str,
+        addon_urls: list[str],
+    ) -> dict | None:
         clean_addons: list[str] = []
         for addon in addon_urls:
             base_url = self._base_url(addon)
@@ -442,65 +494,27 @@ class MetadataService:
             for base_url in clean_addons
         ]
 
-        def keep_warming() -> None:
-            for task in tasks:
-                if not task.done():
-                    task.add_done_callback(
-                        lambda finished: (
-                            finished.exception()
-                            if not finished.cancelled()
-                            else None
-                        )
-                    )
-
-        first_sparse: dict | None = None
-        sparse_deadline: float | None = None
-        loop = asyncio.get_running_loop()
-        pending = set(tasks)
-
         try:
-            while pending:
-                timeout = None
-                if first_sparse is not None and sparse_deadline is not None:
-                    timeout = max(0.0, sparse_deadline - loop.time())
-                    if timeout <= 0:
-                        keep_warming()
-                        return first_sparse
+            for completed in asyncio.as_completed(tasks):
+                try:
+                    result = await completed
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    continue
 
-                done, pending = await asyncio.wait(
-                    pending,
-                    timeout=timeout,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-
-                if not done:
-                    keep_warming()
-                    return first_sparse
-
-                for completed in done:
-                    try:
-                        result = completed.result()
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        continue
-
-                    if not result:
-                        continue
-
-                    if self._metadata_is_rich(result):
-                        keep_warming()
-                        return result
-
-                    if first_sparse is None:
-                        first_sparse = result
-                        # A sparse addon response is not treated as final
-                        # immediately. Give other already-running addons a
-                        # short chance to provide overview/year/artwork, while
-                        # keeping the fast first-valid behavior of v4.
-                        sparse_deadline = loop.time() + 1.5
-
-            return first_sparse
+                if result:
+                    for task in tasks:
+                        if not task.done():
+                            task.add_done_callback(
+                                lambda finished: (
+                                    finished.exception()
+                                    if not finished.cancelled()
+                                    else None
+                                )
+                            )
+                    return result
+            return None
         finally:
             current = asyncio.current_task()
             if current is not None and current.cancelling():
@@ -508,26 +522,52 @@ class MetadataService:
                     if not task.done():
                         task.cancel()
 
-    @staticmethod
-    def _metadata_is_rich(item: dict) -> bool:
-        """
-        Decide whether a metadata response is complete enough to return
-        immediately. Provider IDs (IMDb/TMDB/Douban/etc.) are identifiers,
-        not a substitute for actual descriptive metadata.
-        """
-        if not isinstance(item, dict):
-            return False
+    async def _tmdb_details(
+        self,
+        item_id: str,
+        endpoint_type: str,
+        language: str,
+    ) -> dict | None:
+        try:
+            result = await self.tmdb.details_from_external_id(
+                item_id,
+                media_type=endpoint_type,
+                language=language,
+            )
+        except Exception:
+            return None
+        if not result:
+            return None
 
-        name = str(item.get("name") or "").strip()
-        overview = str(item.get("overview") or "").strip()
-        poster = str(item.get("poster") or "").strip()
-        year = item.get("year")
-
-        return bool(
-            name
-            and overview
-            and (poster or year)
-        )
+        provider_ids = dict(result.get("provider_ids") or {})
+        imdb_id = provider_ids.get("Imdb")
+        raw = {
+            "provider": "tmdb",
+            "providerIds": provider_ids,
+            "tmdb_id": result.get("tmdb_id"),
+            "language": result.get("language"),
+            "original_name": result.get("original_name"),
+            "tagline": result.get("tagline"),
+            "genres": result.get("genres") or [],
+            "rating": result.get("rating"),
+            "release_date": result.get("release_date"),
+            "status": result.get("status"),
+            "number_of_seasons": result.get("number_of_seasons"),
+            "number_of_episodes": result.get("number_of_episodes"),
+        }
+        return {
+            "id": item_id,
+            "imdb_id": imdb_id,
+            "name": result.get("name") or item_id,
+            "type": "Series" if endpoint_type == "series" else "Movie",
+            "overview": result.get("overview") or "",
+            "year": result.get("year"),
+            "poster": result.get("poster"),
+            "backdrop": result.get("background"),
+            "runtime": result.get("runtime_minutes"),
+            "videos": [],
+            "raw": raw,
+        }
 
     async def _fetch_details(
         self,
@@ -597,37 +637,14 @@ class MetadataService:
         endpoint_type = self._normalize_stremio_type(kind)
         raw_id = item.get("id")
 
-        provider_ids = self._provider_ids(item)
-
         imdb_id = (
             item.get("imdb_id")
             or item.get("imdbId")
-            or provider_ids.get("imdb")
-        )
-        tmdb_id = (
-            item.get("tmdb_id")
-            or item.get("tmdbId")
-            or provider_ids.get("tmdb")
-        )
-        douban_id = (
-            item.get("douban_id")
-            or item.get("doubanId")
-            or provider_ids.get("douban")
+            or self._provider_imdb_id(item)
         )
 
-        raw_id_text = str(raw_id or "").strip()
-        if not imdb_id and raw_id_text.startswith("tt"):
-            imdb_id = raw_id_text
-        elif ":" in raw_id_text:
-            raw_provider, raw_value = raw_id_text.split(":", 1)
-            raw_provider = raw_provider.strip().lower()
-            raw_value = raw_value.strip()
-            if raw_value:
-                provider_ids.setdefault(raw_provider, raw_value)
-                if raw_provider == "tmdb" and not tmdb_id:
-                    tmdb_id = raw_value
-                elif raw_provider == "douban" and not douban_id:
-                    douban_id = raw_value
+        if not imdb_id and str(raw_id or "").startswith("tt"):
+            imdb_id = str(raw_id)
 
         date = (
             item.get("releaseInfo")
@@ -649,10 +666,7 @@ class MetadataService:
 
         return {
             "id": raw_id,
-            "imdb_id": str(imdb_id) if imdb_id else None,
-            "tmdb_id": str(tmdb_id) if tmdb_id else None,
-            "douban_id": str(douban_id) if douban_id else None,
-            "provider_ids": provider_ids,
+            "imdb_id": imdb_id,
             "name": (
                 item.get("name")
                 or item.get("title")
@@ -673,41 +687,26 @@ class MetadataService:
         }
 
     @staticmethod
-    def _provider_ids(item: dict) -> dict[str, str]:
+    def _provider_imdb_id(item: dict) -> str | None:
         provider_ids = (
             item.get("providerIds")
             or item.get("provider_ids")
             or {}
         )
 
-        normalized: dict[str, str] = {}
-        if isinstance(provider_ids, dict):
-            for key, value in provider_ids.items():
-                provider = str(key or "").strip().lower()
-                provider_id = str(value or "").strip()
-                if provider and provider_id:
-                    normalized[provider] = provider_id
+        if not isinstance(provider_ids, dict):
+            return None
 
-        direct_fields = {
-            "imdb": ("imdb_id", "imdbId"),
-            "tmdb": ("tmdb_id", "tmdbId"),
-            "douban": ("douban_id", "doubanId"),
-        }
-        for provider, fields in direct_fields.items():
-            if provider in normalized:
-                continue
-            for field in fields:
-                value = str(item.get(field) or "").strip()
-                if value:
-                    normalized[provider] = value
-                    break
+        value = (
+            provider_ids.get("imdb")
+            or provider_ids.get("Imdb")
+            or provider_ids.get("IMDB")
+        )
 
-        return normalized
+        if value:
+            return str(value)
 
-    @staticmethod
-    def _provider_imdb_id(item: dict) -> str | None:
-        # Kept for compatibility with any external/internal callers.
-        return MetadataService._provider_ids(item).get("imdb")
+        return None
 
     @staticmethod
     def _extract_year(value: Any) -> int | None:

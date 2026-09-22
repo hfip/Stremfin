@@ -2717,12 +2717,11 @@ async def episodes(
         if parsed:
             parsed_series_id, parsed_season = parsed
 
-            if parsed_series_id != series_id:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Season does not belong to requested series",
-                )
-
+            # Jellyfin clients may send a SeasonId whose embedded series id
+            # differs from the show id in the route.  SeasonId is sufficient
+            # to identify the requested season, so prefer its season number
+            # instead of rejecting the request.  This mirrors Jellyfin client
+            # compatibility behavior while keeping Stremfin-owned episode IDs.
             requested_season = parsed_season
 
     values = list(meta.get("videos", []))

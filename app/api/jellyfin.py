@@ -129,6 +129,50 @@ def _prefer_media_source(
     )
 
 
+def _prefer_subtitle_stream(
+    media_sources: list[dict[str, Any]],
+    media_source_id: str | None,
+    subtitle_stream_index: int | None,
+) -> list[dict[str, Any]]:
+    if subtitle_stream_index is None:
+        return media_sources
+
+    preferred_source = str(media_source_id or "").strip()
+
+    for media_source in media_sources:
+        source_id = str(media_source.get("Id") or "").strip()
+        if preferred_source and source_id != preferred_source:
+            continue
+
+        streams = media_source.get("MediaStreams") or []
+        found = False
+        for stream in streams:
+            if str(stream.get("Type") or "").lower() != "subtitle":
+                continue
+
+            try:
+                stream_index = int(stream.get("Index"))
+            except (TypeError, ValueError):
+                continue
+
+            selected = stream_index == int(subtitle_stream_index)
+            stream["IsDefault"] = selected
+            if selected:
+                stream["IsForced"] = False
+                found = True
+
+        if found:
+            media_source["DefaultSubtitleStreamIndex"] = int(
+                subtitle_stream_index
+            )
+            media_source["SubtitleStreamIndex"] = int(
+                subtitle_stream_index
+            )
+            break
+
+    return media_sources
+
+
 def _runtime_ticks(value: Any, default: int = 72_000_000_000) -> int:
     try:
         if value is None:
@@ -1524,6 +1568,7 @@ async def _attach_playback_media(
     season: int | None = None,
     episode: int | None = None,
     preferred_media_source_id: str | None = None,
+    preferred_subtitle_stream_index: int | None = None,
 ) -> dict[str, Any]:
     """
     Enrich one playable Item DTO with the same real MediaSources advertised by
@@ -1555,6 +1600,11 @@ async def _attach_playback_media(
     media_sources = _prefer_media_source(
         list(media_sources),
         preferred_media_source_id,
+    )
+    media_sources = _prefer_subtitle_stream(
+        media_sources,
+        preferred_media_source_id,
+        preferred_subtitle_stream_index,
     )
 
     for media_source in media_sources:
@@ -2366,6 +2416,11 @@ async def get_item(
                 if state is not None
                 else None
             ),
+            preferred_subtitle_stream_index=(
+                state.subtitle_stream_index
+                if state is not None
+                else None
+            ),
         )
 
     collection = (
@@ -2398,6 +2453,11 @@ async def get_item(
             str(content_id),
             preferred_media_source_id=(
                 state.media_source_id
+                if state is not None
+                else None
+            ),
+            preferred_subtitle_stream_index=(
+                state.subtitle_stream_index
                 if state is not None
                 else None
             ),
@@ -2823,6 +2883,11 @@ async def _save_playback_progress(
         "MediaSourceId",
         "mediaSourceId",
     )
+    subtitle_stream_index = _progress_value(
+        body,
+        "SubtitleStreamIndex",
+        "subtitleStreamIndex",
+    )
     played_to_completion = bool(
         _progress_value(
             body,
@@ -2847,6 +2912,7 @@ async def _save_playback_progress(
                 position_ticks,
                 runtime_ticks,
                 str(media_source_id) if media_source_id else None,
+                subtitle_stream_index,
             )
     except Exception:
         # Playback telemetry must never interrupt actual playback.
@@ -3026,6 +3092,7 @@ async def _playback_response(
     media_sources = list(result.get("MediaSources") or [])
 
     preferred_media_source_id: str | None = None
+    preferred_subtitle_stream_index: int | None = None
     if not user_id or user_id == USER_ID:
         try:
             state = await _watch_store().get(USER_ID, item_id)
@@ -3033,10 +3100,18 @@ async def _playback_response(
             state = None
         if state is not None:
             preferred_media_source_id = state.media_source_id
+            preferred_subtitle_stream_index = (
+                state.subtitle_stream_index
+            )
 
     media_sources = _prefer_media_source(
         media_sources,
         preferred_media_source_id,
+    )
+    media_sources = _prefer_subtitle_stream(
+        media_sources,
+        preferred_media_source_id,
+        preferred_subtitle_stream_index,
     )
     result["MediaSources"] = media_sources
 

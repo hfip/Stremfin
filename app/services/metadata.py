@@ -457,11 +457,35 @@ class MetadataService:
                         tmdb_result["videos"] = stremio.get("videos") or []
                 return tmdb_result
 
-        return await self._stremio_details(
+        stremio_result = await self._stremio_details(
             item_id,
             endpoint_type,
             addon_urls,
         )
+
+        # Provider-specific IDs (Douban/private addon IDs) may not resolve
+        # directly in TMDB. Use Stremio metadata as a conservative search hint.
+        if self.settings.tmdb_enabled and stremio_result:
+            search_key = (
+                "tmdb-search-meta:"
+                f"{requested_language}:"
+                f"{endpoint_type}:"
+                f"{item_id}:"
+                f"{stremio_result.get('name') or ''}:"
+                f"{stremio_result.get('year') or ''}"
+            )
+            searched = await metadata_cache.get_or_set(
+                search_key,
+                lambda: self._tmdb_details_from_search(
+                    item_id, endpoint_type, requested_language, stremio_result
+                ),
+            )
+            if searched:
+                if endpoint_type == "series":
+                    searched["videos"] = stremio_result.get("videos") or []
+                return searched
+
+        return stremio_result
 
     async def _stremio_details(
         self,
@@ -567,6 +591,68 @@ class MetadataService:
             "runtime": result.get("runtime_minutes"),
             "videos": [],
             "raw": raw,
+        }
+
+    async def _tmdb_details_from_search(
+        self,
+        item_id: str,
+        endpoint_type: str,
+        language: str,
+        stremio: dict,
+    ) -> dict | None:
+        name = str(stremio.get("name") or "").strip()
+        if not name:
+            return None
+
+        raw = stremio.get("raw")
+        raw = raw if isinstance(raw, dict) else {}
+        original_name = (
+            raw.get("original_name")
+            or raw.get("originalName")
+            or raw.get("originalTitle")
+            or raw.get("original_title")
+        )
+        try:
+            result = await self.tmdb.details_from_search(
+                title=name,
+                media_type=endpoint_type,
+                year=stremio.get("year"),
+                language=language,
+                original_title=original_name,
+            )
+        except Exception:
+            return None
+        if not result:
+            return None
+
+        provider_ids = dict(result.get("provider_ids") or {})
+        imdb_id = provider_ids.get("Imdb")
+        return {
+            "id": item_id,
+            "imdb_id": imdb_id or stremio.get("imdb_id"),
+            "name": result.get("name") or name,
+            "type": "Series" if endpoint_type == "series" else "Movie",
+            "overview": result.get("overview") or stremio.get("overview") or "",
+            "year": result.get("year") or stremio.get("year"),
+            "poster": result.get("poster") or stremio.get("poster"),
+            "backdrop": result.get("background") or stremio.get("backdrop"),
+            "runtime": result.get("runtime_minutes") or stremio.get("runtime"),
+            "videos": [],
+            "raw": {
+                "provider": "tmdb",
+                "providerIds": provider_ids,
+                "tmdb_id": result.get("tmdb_id"),
+                "language": result.get("language"),
+                "original_name": result.get("original_name"),
+                "tagline": result.get("tagline"),
+                "genres": result.get("genres") or [],
+                "rating": result.get("rating"),
+                "release_date": result.get("release_date"),
+                "status": result.get("status"),
+                "number_of_seasons": result.get("number_of_seasons"),
+                "number_of_episodes": result.get("number_of_episodes"),
+                "source_item_id": item_id,
+            },
         }
 
     async def _fetch_details(

@@ -2103,20 +2103,153 @@ async def resume_items(
     }
 
 
+def _video_position(video: dict[str, Any]) -> tuple[int, int] | None:
+    try:
+        season = int(video.get("season"))
+        episode = int(video.get("episode"))
+    except (TypeError, ValueError):
+        return None
+
+    if season < 1 or episode < 1:
+        return None
+
+    return season, episode
+
+
+def _next_series_video(
+    videos: list[dict[str, Any]],
+    season_number: int,
+    episode_number: int,
+) -> dict[str, Any] | None:
+    current = (season_number, episode_number)
+
+    candidates: list[tuple[tuple[int, int], dict[str, Any]]] = []
+    for video in videos:
+        position = _video_position(video)
+        if position is None or position <= current:
+            continue
+        candidates.append((position, video))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda entry: entry[0])
+    return candidates[0][1]
+
+
 @router.get("/emby/Shows/NextUp")
 @router.get("/Shows/NextUp")
 async def next_up(
     user_id: str | None = Query(None, alias="UserId"),
     start_index: int = Query(0, alias="StartIndex", ge=0),
     limit: int = Query(DEFAULT_PAGE_SIZE, alias="Limit", ge=1),
+    settings: Settings = Depends(get_settings),
 ):
     if user_id and user_id != USER_ID:
         raise HTTPException(status_code=404, detail="User not found")
 
-    start_index, _ = _normalize_page(start_index, limit)
+    start_index, limit = _normalize_page(start_index, limit)
+    store = _watch_store(settings)
+
+    # Read enough recent episode history to identify the latest completed
+    # episode for each series. Partial episodes remain in Continue Watching
+    # and intentionally do not advance Next Up.
+    states = await store.recent_episode_states(USER_ID, limit=500)
+
+    latest_played_by_series: dict[
+        str,
+        tuple[Any, int, int],
+    ] = {}
+
+    for state in states:
+        if not state.played:
+            continue
+
+        parts = _parse_episode_id(state.item_id)
+        if not parts:
+            continue
+
+        series_id, season_number, episode_number = parts
+        if series_id in latest_played_by_series:
+            continue
+
+        latest_played_by_series[series_id] = (
+            state,
+            season_number,
+            episode_number,
+        )
+
+    next_items: list[tuple[str, dict[str, Any]]] = []
+
+    for series_id, (
+        state,
+        season_number,
+        episode_number,
+    ) in latest_played_by_series.items():
+        try:
+            _, series_meta = await _lookup_series(series_id)
+        except Exception:
+            continue
+
+        if not series_meta:
+            continue
+
+        next_video = _next_series_video(
+            list(series_meta.get("videos") or []),
+            season_number,
+            episode_number,
+        )
+        if next_video is None:
+            continue
+
+        try:
+            dto = _episode_dto(
+                series_id,
+                series_meta.get("name"),
+                next_video,
+            )
+        except Exception:
+            continue
+
+        dto["ProviderIds"] = _provider_ids(series_meta)
+
+        # If this next episode already has watch data, expose it. Normally it
+        # will be untouched, but this keeps the DTO truthful across clients.
+        try:
+            next_state = await store.get(
+                USER_ID,
+                str(dto["Id"]),
+            )
+        except Exception:
+            next_state = None
+
+        if next_state is not None:
+            dto["UserData"] = next_state.jellyfin_user_data()
+
+        next_items.append(
+            (
+                str(state.updated_at or ""),
+                dto,
+            )
+        )
+
+    # Most recently watched series first.
+    next_items.sort(
+        key=lambda entry: entry[0],
+        reverse=True,
+    )
+
+    total = len(next_items)
+    page = [
+        dto
+        for _, dto in next_items[
+            start_index : start_index + limit
+        ]
+    ]
+
     return {
-        "Items": [],
-        "TotalRecordCount": 0,
+        "Items": page,
+        "TotalRecordCount": total,
         "StartIndex": start_index,
     }
 

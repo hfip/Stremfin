@@ -468,6 +468,44 @@ class WatchStateStore:
             if (state := self._row_to_state(row)) is not None
         ]
 
+    async def recent_episode_states(
+        self,
+        user_id: str,
+        limit: int = 100,
+    ) -> list[WatchState]:
+        await self.ensure_ready()
+        safe_limit = max(1, min(int(limit), 500))
+        return await asyncio.to_thread(
+            self._recent_episode_states_sync,
+            str(user_id),
+            safe_limit,
+        )
+
+    def _recent_episode_states_sync(
+        self,
+        user_id: str,
+        limit: int,
+    ) -> list[WatchState]:
+        with self._connect() as db:
+            rows = db.execute(
+                """
+                SELECT *
+                FROM watch_state
+                WHERE user_id = ?
+                  AND item_id LIKE '%:s%e%'
+                  AND (played = 1 OR position_ticks > 0)
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (user_id, limit),
+            ).fetchall()
+
+        return [
+            state
+            for row in rows
+            if (state := self._row_to_state(row)) is not None
+        ]
+
     async def resume_count(self, user_id: str) -> int:
         await self.ensure_ready()
         return await asyncio.to_thread(self._resume_count_sync, user_id)

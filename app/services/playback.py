@@ -29,6 +29,22 @@ playback_cache = AsyncTTLCache(
     persistent_namespace="playback",
 )
 
+# Keep the URL that was actually issued for a stable MediaSource Id separate
+# from the full source-list cache.  The mapping is refreshed whenever a client
+# receives the source list, so pressing Play can reuse that exact URL without
+# re-resolving the item.  The stable Id itself remains candidate-based and is
+# never derived from an expiring Debrid URL.
+issued_source_cache = AsyncTTLCache(
+    ttl_seconds=3600,
+    stale_seconds=0,
+    maxsize=4096,
+    persistent_path=os.getenv(
+        "DATABASE_PATH",
+        "./data/stremfin.db",
+    ),
+    persistent_namespace="playback-issued-source",
+)
+
 
 @dataclass(slots=True)
 class ResolvedMediaSource:
@@ -92,7 +108,9 @@ class PlaybackResolver:
                 episode_number,
             ),
         )
-        return self._deserialize_sources(cached)
+        sources = self._deserialize_sources(cached)
+        await self._remember_issued_sources(sources)
+        return sources
 
     async def playback_info(
         self,
@@ -123,17 +141,68 @@ class PlaybackResolver:
         episode: int | None = None,
         media_source_id: str | None = None,
     ) -> str | None:
-        sources = await self.resolve(item_id, season, episode)
+        content_id = str(item_id or "").strip()
+        requested = str(media_source_id or "").strip()
+
+        # A client may ask to play a MediaSource after the full source-list
+        # cache has changed or expired.  Prefer the exact URL that Stremfin
+        # previously issued for that stable MediaSource Id.
+        if content_id and requested:
+            issued = await issued_source_cache.get(
+                self._issued_source_key(content_id, requested)
+            )
+            if isinstance(issued, str):
+                issued_url = issued.strip()
+                if self._is_client_playable_url(issued_url):
+                    return issued_url
+
+        sources = await self.resolve(content_id, season, episode)
         if not sources:
             return None
 
-        requested = str(media_source_id or "").strip()
         if requested:
             for source in sources:
                 if source.id == requested:
+                    await self._remember_issued_source(source)
                     return source.url
 
+        await self._remember_issued_source(sources[0])
         return sources[0].url
+
+    async def _remember_issued_sources(
+        self,
+        sources: list[ResolvedMediaSource],
+    ) -> None:
+        if not sources:
+            return
+
+        await asyncio.gather(
+            *(self._remember_issued_source(source) for source in sources),
+            return_exceptions=True,
+        )
+
+    async def _remember_issued_source(
+        self,
+        source: ResolvedMediaSource,
+    ) -> None:
+        if (
+            not source.id
+            or not source.item_id
+            or not self._is_client_playable_url(source.url)
+        ):
+            return
+
+        await issued_source_cache.set(
+            self._issued_source_key(source.item_id, source.id),
+            source.url,
+        )
+
+    @staticmethod
+    def _issued_source_key(
+        item_id: str,
+        media_source_id: str,
+    ) -> str:
+        return f"issued:v1:{item_id}:{media_source_id}"
 
     async def _resolve_serializable(
         self,

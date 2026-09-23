@@ -25,6 +25,7 @@ from app.services.dashboard_auth import (
 )
 from app.services.cache import metadata_cache
 from app.services.metadata import MetadataService
+from app.services.performance import install_performance_metrics
 from app.services.settings_store import AppSettings, SettingsStore
 
 
@@ -37,6 +38,7 @@ app = FastAPI(
     description="Jellyfin-compatible bridge for live Stremio addons",
 )
 app.include_router(jellyfin_router)
+install_performance_metrics(app)
 
 _MANIFEST_CACHE_TTL = 300.0
 _manifest_cache: dict[str, tuple[float, dict[str, Any]]] = {}

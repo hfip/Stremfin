@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -15,6 +16,7 @@ from app.services.tmdb import TMDBProvider, normalize_language
 
 
 logger = logging.getLogger(__name__)
+perf_logger = logging.getLogger("uvicorn.error")
 
 
 class MetadataService:
@@ -48,6 +50,14 @@ class MetadataService:
     @staticmethod
     def _safe_segment(value: Any) -> str:
         return quote(str(value or ""), safe=":@._~-")
+
+    @staticmethod
+    def _addon_label(base_url: str) -> str:
+        """Return a safe addon label without query strings or credentials."""
+        value = str(base_url or "").split("?", 1)[0].rstrip("/")
+        if "://" in value:
+            value = value.split("://", 1)[1]
+        return value[:120]
 
     async def manifests(self) -> list[dict]:
         addon_urls = [
@@ -155,12 +165,6 @@ class MetadataService:
         limit: int,
         selected: list[dict],
     ) -> list[dict]:
-        """
-        Return a small, fast foreground catalog window.
-
-        The request path intentionally does not build a complete catalog
-        snapshot. This keeps Jellyfin/Emby clients responsive.
-        """
         endpoint_type = "series" if kind in ("series", "tv") else "movie"
 
         try:
@@ -173,7 +177,6 @@ class MetadataService:
         if not catalogs:
             return []
 
-        # Fetch only each selected catalog's base page, concurrently.
         responses = await asyncio.gather(
             *(
                 self._cached_catalog_page(
@@ -203,14 +206,6 @@ class MetadataService:
         limit: int,
         selected: list[dict],
     ) -> dict:
-        """
-        Fast foreground page for Jellyfin/Emby clients.
-
-        Advanced full-catalog pagination is deliberately deferred to the
-        future background-cache stage. TotalRecordCount therefore describes
-        the currently available foreground window and never triggers a costly
-        synchronous crawl.
-        """
         try:
             start = max(0, int(start_index))
         except (TypeError, ValueError):
@@ -222,8 +217,6 @@ class MetadataService:
             page_limit = self.DEFAULT_CATALOG_PAGE_SIZE
 
         page_limit = min(page_limit, 100)
-
-        # The stable foreground window is intentionally capped at 100.
         foreground_limit = min(max(start + page_limit, page_limit), 100)
         items = await self.catalog(
             kind=kind,
@@ -275,7 +268,6 @@ class MetadataService:
         catalog: dict,
         required_count: int,
     ) -> list[dict]:
-        """Fast compatibility helper: base page only, never a full crawl."""
         try:
             requested = max(1, min(int(required_count), 100))
         except (TypeError, ValueError):
@@ -428,6 +420,7 @@ class MetadataService:
         if not item_id:
             return None
 
+        total_started = time.perf_counter()
         requested_language = normalize_language(
             language,
             default=self.settings.tmdb_default_language,
@@ -445,6 +438,7 @@ class MetadataService:
                 f"{endpoint_type}:"
                 f"{item_id}"
             )
+            tmdb_started = time.perf_counter()
             tmdb_result = await metadata_cache.get_or_set(
                 tmdb_key,
                 lambda: self._tmdb_details(
@@ -453,6 +447,14 @@ class MetadataService:
                     requested_language,
                 ),
             )
+            tmdb_ms = (time.perf_counter() - tmdb_started) * 1000
+            perf_logger.info(
+                "[META-PERF] item=%s type=%s stage=tmdb_cache_or_upstream result=%s total=%.2fms",
+                item_id,
+                endpoint_type,
+                "hit" if tmdb_result else "miss",
+                tmdb_ms,
+            )
             logger.info(
                 "[metadata] direct_tmdb item=%s result=%s tmdb_id=%s name=%r",
                 item_id, "hit" if tmdb_result else "miss",
@@ -460,24 +462,46 @@ class MetadataService:
                 tmdb_result.get("name") if tmdb_result else None,
             )
             if tmdb_result:
-                # For series, preserve Stremio's videos list because Seasons
-                # and Next Up currently depend on that topology.
                 if endpoint_type == "series":
+                    stremio_started = time.perf_counter()
                     stremio = await self._stremio_details(
                         item_id,
                         endpoint_type,
                         addon_urls,
                     )
+                    perf_logger.info(
+                        "[META-PERF] item=%s type=%s stage=series_stremio_topology result=%s total=%.2fms",
+                        item_id,
+                        endpoint_type,
+                        "hit" if stremio else "miss",
+                        (time.perf_counter() - stremio_started) * 1000,
+                    )
                     if stremio:
                         tmdb_result["videos"] = stremio.get("videos") or []
+                perf_logger.info(
+                    "[META-PERF] item=%s type=%s selected=tmdb total=%.2fms",
+                    item_id,
+                    endpoint_type,
+                    (time.perf_counter() - total_started) * 1000,
+                )
                 logger.info("[metadata] selected item=%s provider=tmdb via=direct", item_id)
                 return tmdb_result
 
-        return await self._stremio_details(
+        stremio_started = time.perf_counter()
+        result = await self._stremio_details(
             item_id,
             endpoint_type,
             addon_urls,
         )
+        perf_logger.info(
+            "[META-PERF] item=%s type=%s selected=stremio result=%s stremio=%.2fms total=%.2fms",
+            item_id,
+            endpoint_type,
+            "hit" if result else "miss",
+            (time.perf_counter() - stremio_started) * 1000,
+            (time.perf_counter() - total_started) * 1000,
+        )
+        return result
 
     async def _stremio_details(
         self,
@@ -492,11 +516,17 @@ class MetadataService:
                 clean_addons.append(base_url)
 
         if not clean_addons:
+            perf_logger.info(
+                "[META-PERF] item=%s type=%s stage=stremio no_addons=true total=0.00ms",
+                item_id,
+                endpoint_type,
+            )
             return None
 
         async def load_from_addon(base_url: str) -> dict | None:
             key = f"meta:{base_url}:{endpoint_type}:{item_id}"
-            return await metadata_cache.get_or_set(
+            started = time.perf_counter()
+            result = await metadata_cache.get_or_set(
                 key,
                 lambda b=base_url: self._fetch_details(
                     b,
@@ -504,7 +534,17 @@ class MetadataService:
                     item_id,
                 ),
             )
+            perf_logger.info(
+                "[META-PERF] item=%s type=%s stage=stremio_addon addon=%s result=%s total=%.2fms",
+                item_id,
+                endpoint_type,
+                self._addon_label(base_url),
+                "hit" if result else "miss",
+                (time.perf_counter() - started) * 1000,
+            )
+            return result
 
+        group_started = time.perf_counter()
         tasks = [
             asyncio.create_task(load_from_addon(base_url))
             for base_url in clean_addons
@@ -520,6 +560,13 @@ class MetadataService:
                     continue
 
                 if result:
+                    perf_logger.info(
+                        "[META-PERF] item=%s type=%s stage=stremio_first_valid addons=%d total=%.2fms",
+                        item_id,
+                        endpoint_type,
+                        len(clean_addons),
+                        (time.perf_counter() - group_started) * 1000,
+                    )
                     for task in tasks:
                         if not task.done():
                             task.add_done_callback(
@@ -530,6 +577,14 @@ class MetadataService:
                                 )
                             )
                     return result
+
+            perf_logger.info(
+                "[META-PERF] item=%s type=%s stage=stremio_all_miss addons=%d total=%.2fms",
+                item_id,
+                endpoint_type,
+                len(clean_addons),
+                (time.perf_counter() - group_started) * 1000,
+            )
             return None
         finally:
             current = asyncio.current_task()
@@ -544,6 +599,7 @@ class MetadataService:
         endpoint_type: str,
         language: str,
     ) -> dict | None:
+        started = time.perf_counter()
         try:
             result = await self.tmdb.details_from_external_id(
                 item_id,
@@ -551,7 +607,20 @@ class MetadataService:
                 language=language,
             )
         except Exception:
+            perf_logger.info(
+                "[META-PERF] item=%s type=%s stage=tmdb_upstream result=error total=%.2fms",
+                item_id,
+                endpoint_type,
+                (time.perf_counter() - started) * 1000,
+            )
             return None
+        perf_logger.info(
+            "[META-PERF] item=%s type=%s stage=tmdb_upstream result=%s total=%.2fms",
+            item_id,
+            endpoint_type,
+            "hit" if result else "miss",
+            (time.perf_counter() - started) * 1000,
+        )
         if not result:
             return None
 
@@ -594,6 +663,7 @@ class MetadataService:
         type_segment = self._safe_segment(endpoint_type)
         item_segment = self._safe_segment(item_id)
         url = f"{base_url}/meta/{type_segment}/{item_segment}.json"
+        started = time.perf_counter()
 
         async with httpx.AsyncClient(
             timeout=self.settings.request_timeout_seconds,
@@ -601,14 +671,38 @@ class MetadataService:
         ) as client:
             try:
                 response = await client.get(url)
-                if response.status_code == 404:
+                status_code = response.status_code
+                if status_code == 404:
+                    perf_logger.info(
+                        "[META-PERF] item=%s type=%s stage=stremio_upstream addon=%s status=404 total=%.2fms",
+                        item_id,
+                        endpoint_type,
+                        self._addon_label(base_url),
+                        (time.perf_counter() - started) * 1000,
+                    )
                     return None
                 response.raise_for_status()
                 payload = response.json()
             except (httpx.HTTPError, ValueError, TypeError):
+                perf_logger.info(
+                    "[META-PERF] item=%s type=%s stage=stremio_upstream addon=%s status=error total=%.2fms",
+                    item_id,
+                    endpoint_type,
+                    self._addon_label(base_url),
+                    (time.perf_counter() - started) * 1000,
+                )
                 return None
 
         item = self._extract_meta(payload)
+        perf_logger.info(
+            "[META-PERF] item=%s type=%s stage=stremio_upstream addon=%s status=%s result=%s total=%.2fms",
+            item_id,
+            endpoint_type,
+            self._addon_label(base_url),
+            status_code,
+            "hit" if item else "miss",
+            (time.perf_counter() - started) * 1000,
+        )
         if not item:
             return None
         return self._normalize(item, endpoint_type)

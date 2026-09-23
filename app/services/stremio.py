@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote, urlencode
@@ -25,16 +26,25 @@ from app.services.cache import AsyncTTLCache
 # AsyncTTLCache already provides per-key request coalescing (single-flight), so
 # concurrent Jellyfin clients requesting the same provider/item share one
 # upstream request instead of starting duplicate scrapes.
+_CACHE_DB_PATH = os.getenv(
+    "DATABASE_PATH",
+    "./data/stremfin.db",
+)
+
 addon_stream_cache = AsyncTTLCache(
     ttl_seconds=900,
     stale_seconds=900,
     maxsize=2048,
+    persistent_path=_CACHE_DB_PATH,
+    persistent_namespace="stremio-provider-v1",
 )
 
 stream_cache = AsyncTTLCache(
     ttl_seconds=60,
     stale_seconds=120,
     maxsize=1024,
+    persistent_path=_CACHE_DB_PATH,
+    persistent_namespace="stremio-config-v1",
 )
 
 
@@ -150,18 +160,36 @@ class StremioResolver:
             stream_id,
         )
 
-        return await stream_cache.get_or_set(
+        cached = await stream_cache.get_or_set(
             cache_key,
-            lambda: self._resolve_uncached(
+            lambda: self._resolve_serializable(
                 addon_urls=addon_urls,
                 content_type=content_type,
                 stream_id=stream_id,
             ),
         )
 
+        return self._deserialize_candidates(cached)
+
     # ------------------------------------------------------------------
     # Resolution
     # ------------------------------------------------------------------
+
+    async def _resolve_serializable(
+        self,
+        addon_urls: list[str],
+        content_type: str,
+        stream_id: str,
+    ) -> list[dict[str, Any]]:
+        candidates = await self._resolve_uncached(
+            addon_urls=addon_urls,
+            content_type=content_type,
+            stream_id=stream_id,
+        )
+        return [
+            self._serialize_candidate(candidate)
+            for candidate in candidates
+        ]
 
     async def _resolve_uncached(
         self,
@@ -187,7 +215,7 @@ class StremioResolver:
                         content_type=content_type,
                         stream_id=stream_id,
                     ),
-                    lambda addon_url=addon_url: self._resolve_addon(
+                    lambda addon_url=addon_url: self._resolve_addon_serializable(
                         client=client,
                         addon_url=addon_url,
                         content_type=content_type,
@@ -208,9 +236,29 @@ class StremioResolver:
             if isinstance(response, BaseException):
                 continue
 
-            candidates.extend(response)
+            candidates.extend(
+                self._deserialize_candidates(response)
+            )
 
         return self._deduplicate(candidates)
+
+    async def _resolve_addon_serializable(
+        self,
+        client: httpx.AsyncClient,
+        addon_url: str,
+        content_type: str,
+        stream_id: str,
+    ) -> list[dict[str, Any]]:
+        candidates = await self._resolve_addon(
+            client=client,
+            addon_url=addon_url,
+            content_type=content_type,
+            stream_id=stream_id,
+        )
+        return [
+            self._serialize_candidate(candidate)
+            for candidate in candidates
+        ]
 
     async def _resolve_addon(
         self,
@@ -617,6 +665,92 @@ class StremioResolver:
             .removesuffix("/manifest.json")
             .rstrip("/")
         )
+
+    # ------------------------------------------------------------------
+    # Persistent cache serialization
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _serialize_candidate(
+        candidate: StreamCandidate,
+    ) -> dict[str, Any]:
+        return {
+            "url": candidate.url,
+            "title": candidate.title,
+            "behavior_hints": candidate.behavior_hints,
+            "source": candidate.source,
+            "addon_url": candidate.addon_url,
+            "name": candidate.name,
+            "description": candidate.description,
+            "info_hash": candidate.info_hash,
+            "file_idx": candidate.file_idx,
+            "raw": candidate.raw,
+        }
+
+    @staticmethod
+    def _deserialize_candidates(
+        value: Any,
+    ) -> list[StreamCandidate]:
+        if not isinstance(value, list):
+            return []
+
+        output: list[StreamCandidate] = []
+
+        for raw in value:
+            if not isinstance(raw, dict):
+                continue
+
+            url = str(raw.get("url") or "").strip()
+            if not url:
+                continue
+
+            file_idx = raw.get("file_idx")
+            try:
+                if file_idx is not None:
+                    file_idx = int(file_idx)
+            except (TypeError, ValueError):
+                file_idx = None
+
+            behavior_hints = raw.get("behavior_hints")
+            if not isinstance(behavior_hints, dict):
+                behavior_hints = {}
+
+            raw_stream = raw.get("raw")
+            if not isinstance(raw_stream, dict):
+                raw_stream = {}
+
+            output.append(
+                StreamCandidate(
+                    url=url,
+                    title=str(raw.get("title") or "Stremio stream"),
+                    behavior_hints=behavior_hints,
+                    source=str(raw.get("source") or "direct"),
+                    addon_url=(
+                        str(raw.get("addon_url"))
+                        if raw.get("addon_url") is not None
+                        else None
+                    ),
+                    name=(
+                        str(raw.get("name"))
+                        if raw.get("name") is not None
+                        else None
+                    ),
+                    description=(
+                        str(raw.get("description"))
+                        if raw.get("description") is not None
+                        else None
+                    ),
+                    info_hash=(
+                        str(raw.get("info_hash"))
+                        if raw.get("info_hash") is not None
+                        else None
+                    ),
+                    file_idx=file_idx,
+                    raw=raw_stream,
+                )
+            )
+
+        return output
 
     # ------------------------------------------------------------------
     # Deduplication

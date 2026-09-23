@@ -1,9 +1,13 @@
-"""Read-only performance instrumentation for Stremfin.
+"""Read-only performance and client-flow instrumentation for Stremfin.
 
 Measures the user-visible Jellyfin/Emby request pipeline without changing
 responses, playback, metadata, subtitles, or cache behavior.
 
-Security: query strings and headers are intentionally never logged.
+Security:
+- query strings are never logged
+- authorization/API tokens are never logged
+- raw headers and request/response bodies are never logged
+- User-Agent is reduced to a coarse client family only
 """
 
 from __future__ import annotations
@@ -16,7 +20,6 @@ from threading import Lock
 
 from fastapi import FastAPI, Request
 
-# Reuse Uvicorn's configured INFO logger so metrics are visible in Docker logs.
 logger = logging.getLogger("uvicorn.error")
 
 
@@ -45,6 +48,17 @@ def _category(method: str, path: str) -> str | None:
 
     if "/subtitles/" in lower or lower.startswith("/emby/subtitles/"):
         return "SUBTITLE"
+
+    if "/videos/" in lower and (
+        "/stream" in lower
+        or lower.endswith("/stream")
+        or "/master.m3u8" in lower
+        or lower.endswith(".m3u8")
+    ):
+        return "VIDEO_STREAM"
+
+    if "/sessions/playing" in lower:
+        return "SESSION_PLAYING"
 
     if "/images/" in lower:
         return "IMAGE"
@@ -81,6 +95,53 @@ def _category(method: str, path: str) -> str | None:
         return "AUTH"
 
     return None
+
+
+def _client_family(request: Request) -> str:
+    """Return only a coarse client label; never expose the raw User-Agent."""
+    user_agent = str(request.headers.get("user-agent") or "").lower()
+
+    checks = (
+        ("senplayer", "SenPlayer"),
+        ("sen player", "SenPlayer"),
+        ("rex", "Rex"),
+        ("vidhub", "VidHub"),
+        ("infuse", "Infuse"),
+        ("forward", "Forward"),
+        ("jellyfin", "Jellyfin"),
+        ("emby", "Emby"),
+    )
+    for needle, label in checks:
+        if needle in user_agent:
+            return label
+
+    return "Unknown"
+
+
+def _is_client_flow_path(path: str, category: str | None) -> bool:
+    """Select only Jellyfin/Emby playback-discovery traffic for flow logging."""
+    if category in {
+        "PLAYBACK_INFO",
+        "VIDEO_STREAM",
+        "MEDIA_SEGMENTS",
+        "SUBTITLE",
+        "SESSION_PLAYING",
+        "USER_ITEM",
+    }:
+        return True
+
+    lower = path.lower()
+
+    # Capture compatibility endpoints that a client may use instead of
+    # PlaybackInfo.  Keep images/catalog browsing out of this verbose trace.
+    markers = (
+        "/videos/",
+        "/playbackinfo",
+        "/mediasegments/",
+        "/sessions/",
+        "/livetv/",
+    )
+    return any(marker in lower for marker in markers)
 
 
 def _image_group(path: str) -> str:
@@ -127,35 +188,69 @@ def _log_image_summary(path: str, duration_ms: float) -> None:
 
 
 def install_performance_metrics(app: FastAPI) -> None:
-    """Install safe request timing middleware."""
+    """Install safe request timing + playback client-flow middleware."""
 
     @app.middleware("http")
     async def performance_metrics(request: Request, call_next):
         path = request.url.path
         category = _category(request.method, path)
+        trace_flow = _is_client_flow_path(path, category)
+        client = _client_family(request) if trace_flow else "Unknown"
 
-        if category is None:
+        if category is None and not trace_flow:
             return await call_next(request)
 
         started = time.perf_counter()
+
+        if trace_flow:
+            logger.info(
+                "[CLIENT-FLOW] phase=request client=%s method=%s path=%s category=%s",
+                client,
+                request.method,
+                path,
+                category or "UNCLASSIFIED",
+            )
+
         try:
             response = await call_next(request)
         except Exception:
             duration_ms = (time.perf_counter() - started) * 1000
-            logger.exception(
-                "[PERF] %s method=%s path=%s status=ERROR total=%.2fms",
-                category,
-                request.method,
-                path,
-                duration_ms,
-            )
+
+            if trace_flow:
+                logger.exception(
+                    "[CLIENT-FLOW] phase=response client=%s method=%s path=%s category=%s status=ERROR total=%.2fms",
+                    client,
+                    request.method,
+                    path,
+                    category or "UNCLASSIFIED",
+                    duration_ms,
+                )
+            elif category is not None:
+                logger.exception(
+                    "[PERF] %s method=%s path=%s status=ERROR total=%.2fms",
+                    category,
+                    request.method,
+                    path,
+                    duration_ms,
+                )
             raise
 
         duration_ms = (time.perf_counter() - started) * 1000
 
+        if trace_flow:
+            logger.info(
+                "[CLIENT-FLOW] phase=response client=%s method=%s path=%s category=%s status=%s total=%.2fms",
+                client,
+                request.method,
+                path,
+                category or "UNCLASSIFIED",
+                response.status_code,
+                duration_ms,
+            )
+
         if category == "IMAGE":
             _log_image_summary(path, duration_ms)
-        else:
+        elif category is not None:
             logger.info(
                 "[PERF] %s method=%s path=%s status=%s total=%.2fms",
                 category,

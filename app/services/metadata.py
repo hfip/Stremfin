@@ -31,6 +31,7 @@ class MetadataService:
     DEFAULT_CATALOG_PAGE_SIZE = 20
     MAX_CATALOG_PAGES_PER_ADDON = 250
     MAX_CATALOG_ITEMS = 20000
+    METADATA_FOREGROUND_BUDGET_SECONDS = 1.25
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -551,32 +552,63 @@ class MetadataService:
         ]
 
         try:
-            for completed in asyncio.as_completed(tasks):
-                try:
-                    result = await completed
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    continue
+            try:
+                completed_tasks = asyncio.as_completed(
+                    tasks,
+                    timeout=self.METADATA_FOREGROUND_BUDGET_SECONDS,
+                )
+                for completed in completed_tasks:
+                    try:
+                        result = await completed
+                    except asyncio.CancelledError:
+                        raise
+                    except asyncio.TimeoutError:
+                        break
+                    except Exception:
+                        continue
 
-                if result:
-                    perf_logger.info(
-                        "[META-PERF] item=%s type=%s stage=stremio_first_valid addons=%d total=%.2fms",
-                        item_id,
-                        endpoint_type,
-                        len(clean_addons),
-                        (time.perf_counter() - group_started) * 1000,
-                    )
-                    for task in tasks:
-                        if not task.done():
-                            task.add_done_callback(
-                                lambda finished: (
-                                    finished.exception()
-                                    if not finished.cancelled()
-                                    else None
+                    if result:
+                        perf_logger.info(
+                            "[META-PERF] item=%s type=%s stage=stremio_first_valid addons=%d total=%.2fms",
+                            item_id,
+                            endpoint_type,
+                            len(clean_addons),
+                            (time.perf_counter() - group_started) * 1000,
+                        )
+                        for task in tasks:
+                            if not task.done():
+                                task.add_done_callback(
+                                    lambda finished: (
+                                        finished.exception()
+                                        if not finished.cancelled()
+                                        else None
+                                    )
                                 )
+                        return result
+            except asyncio.TimeoutError:
+                pass
+
+            pending = sum(1 for task in tasks if not task.done())
+            if pending:
+                for task in tasks:
+                    if not task.done():
+                        task.add_done_callback(
+                            lambda finished: (
+                                finished.exception()
+                                if not finished.cancelled()
+                                else None
                             )
-                    return result
+                        )
+                perf_logger.info(
+                    "[META-PERF] item=%s type=%s stage=stremio_foreground_budget addons=%d pending=%d budget=%.2fs total=%.2fms",
+                    item_id,
+                    endpoint_type,
+                    len(clean_addons),
+                    pending,
+                    self.METADATA_FOREGROUND_BUDGET_SECONDS,
+                    (time.perf_counter() - group_started) * 1000,
+                )
+                return None
 
             perf_logger.info(
                 "[META-PERF] item=%s type=%s stage=stremio_all_miss addons=%d total=%.2fms",

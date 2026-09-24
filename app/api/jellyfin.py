@@ -43,6 +43,14 @@ DEFAULT_PAGE_SIZE = 20
 _ARTWORK_CACHE: dict[str, dict[str, str]] = {}
 _ARTWORK_CACHE_MAXSIZE = 5000
 
+# Preserve the canonical Movie/Series identity learned from catalog responses.
+# Some metadata addons can answer both movie and series lookups for the same
+# external id. Remembering the catalog-owned kind prevents a later generic
+# Item/PlaybackInfo request from accidentally flipping a Movie into a Series.
+# Only public item ids and coarse media kinds are stored here; no user/auth data.
+_ENTITY_KIND_CACHE: dict[str, str] = {}
+_ENTITY_KIND_CACHE_MAXSIZE = 10000
+
 _EPISODE_ID_RE = re.compile(r"^(?P<series>.+):s(?P<season>\d+)e(?P<episode>\d+)$")
 _SEASON_ID_RE = re.compile(r"^(?P<series>.+):s(?P<season>\d+)$")
 
@@ -419,6 +427,25 @@ def _logo_url(meta: dict[str, Any]) -> str | None:
     return str(value).strip() if value else None
 
 
+def _remember_entity_kind(item_id: Any, kind: str) -> None:
+    value = str(item_id or "").strip()
+    normalized = str(kind or "").strip().lower()
+
+    if not value or normalized not in {"movie", "series"}:
+        return
+
+    _ENTITY_KIND_CACHE[value] = normalized
+    while len(_ENTITY_KIND_CACHE) > _ENTITY_KIND_CACHE_MAXSIZE:
+        _ENTITY_KIND_CACHE.pop(next(iter(_ENTITY_KIND_CACHE)), None)
+
+
+def _canonical_entity_kind(item_id: Any) -> str | None:
+    value = str(item_id or "").strip()
+    if not value:
+        return None
+    return _ENTITY_KIND_CACHE.get(value)
+
+
 def _item(meta: dict[str, Any], collection: str) -> dict[str, Any]:
     item_id = meta.get("id") or meta.get("imdb_id")
 
@@ -426,7 +453,19 @@ def _item(meta: dict[str, Any], collection: str) -> dict[str, Any]:
         raise ValueError("Metadata item has no stable id")
 
     raw_type = str(meta.get("type") or "").lower()
-    is_series = raw_type == "series"
+    collection_kind = (
+        "series"
+        if collection == TVSHOWS_VIEW_ID
+        else "movie"
+        if collection == MOVIES_VIEW_ID
+        else None
+    )
+    canonical_kind = collection_kind or (
+        "series" if raw_type == "series" else "movie"
+    )
+    _remember_entity_kind(item_id, canonical_kind)
+
+    is_series = canonical_kind == "series"
     display_name = _display_name(meta)
 
     artwork: dict[str, str] = {}
@@ -1487,12 +1526,43 @@ async def _lookup(item_id: str):
             "_season_number": season_number,
         }
 
+    # Generic Item/PlaybackInfo requests do not carry the originating catalog
+    # type. Prefer the canonical kind learned while the item was listed.
+    canonical_kind = _canonical_entity_kind(item_id)
+
+    if canonical_kind == "movie":
+        runtime, movie_meta = await _lookup_movie(item_id)
+        if movie_meta:
+            _remember_entity_kind(item_id, "movie")
+            return runtime, movie_meta
+
+        runtime, series_meta = await _lookup_series(item_id)
+        if series_meta:
+            _remember_entity_kind(item_id, "series")
+        return runtime, series_meta
+
+    if canonical_kind == "series":
+        runtime, series_meta = await _lookup_series(item_id)
+        if series_meta:
+            _remember_entity_kind(item_id, "series")
+            return runtime, series_meta
+
+        runtime, movie_meta = await _lookup_movie(item_id)
+        if movie_meta:
+            _remember_entity_kind(item_id, "movie")
+        return runtime, movie_meta
+
+    # Preserve the established deep-link behavior for ids Stremfin has not yet
+    # seen in a catalog, then remember the successful result for consistency.
     runtime, series_meta = await _lookup_series(item_id)
 
     if series_meta:
+        _remember_entity_kind(item_id, "series")
         return runtime, series_meta
 
     runtime, movie_meta = await _lookup_movie(item_id)
+    if movie_meta:
+        _remember_entity_kind(item_id, "movie")
 
     return runtime, movie_meta
 

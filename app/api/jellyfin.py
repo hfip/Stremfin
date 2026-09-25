@@ -1677,6 +1677,22 @@ async def _attach_playback_media(
         preferred_subtitle_stream_index,
     )
 
+    # Jellyfin-compatible episode identity: some clients (notably Rex) expect
+    # the primary episode MediaSource Id to match the playable Episode item Id.
+    # Remux follows the same convention. Keep alternate source ids unchanged so
+    # source selection remains stable, and give every source a matching ETag.
+    if media_sources:
+        for media_source in media_sources:
+            source_id = str(media_source.get("Id") or "").strip()
+            if source_id:
+                media_source["ETag"] = source_id
+
+        if season is not None and episode is not None:
+            primary_id = str(dto.get("Id") or "").strip()
+            if primary_id:
+                media_sources[0]["Id"] = primary_id
+                media_sources[0]["ETag"] = primary_id
+
     for media_source in media_sources:
         existing_streams = list(
             media_source.get("MediaStreams") or []
@@ -3326,6 +3342,21 @@ async def _playback_response(
         preferred_media_source_id,
         preferred_subtitle_stream_index,
     )
+    # Match Jellyfin/Remux episode identity semantics for clients that bind the
+    # selected version to the playable Episode Id. Movies keep their existing
+    # source ids because they are already working across the tested clients.
+    if media_sources:
+        for media_source in media_sources:
+            source_id = str(media_source.get("Id") or "").strip()
+            if source_id:
+                media_source["ETag"] = source_id
+
+        if season_number is not None and episode_number is not None:
+            primary_id = str(item_id or "").strip()
+            if primary_id:
+                media_sources[0]["Id"] = primary_id
+                media_sources[0]["ETag"] = primary_id
+
     result["MediaSources"] = media_sources
 
     # Subtitle discovery is intentionally deferred until PlaybackInfo instead

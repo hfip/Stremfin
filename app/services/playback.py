@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -14,6 +15,8 @@ from app.config import Settings
 from app.services.cache import AsyncTTLCache
 from app.services.debrid import DebridResolutionError, DebridResolver
 from app.services.stremio import StreamCandidate, StremioResolver
+
+logger = logging.getLogger("uvicorn.error")
 
 
 # Item details and PlaybackInfo intentionally share this cache.  Infuse can
@@ -119,8 +122,34 @@ class PlaybackResolver:
         episode: int | None = None,
     ) -> dict[str, Any]:
         sources = await self.resolve(item_id, season, episode)
+        media_sources = [self.media_source_dto(source) for source in sources]
+
+        # Privacy-safe PlaybackInfo diagnostics.  This deliberately records only
+        # compatibility metadata and counts; source URLs, headers, credentials,
+        # tokens, and request payloads are never logged.
+        logger.info(
+            "[PLAYBACK-DIAG] item=%s season=%s episode=%s sources=%d details=%s",
+            str(item_id or "")[:160],
+            season,
+            episode,
+            len(media_sources),
+            [
+                {
+                    "protocol": source.get("Protocol"),
+                    "container": source.get("Container"),
+                    "direct_play": source.get("SupportsDirectPlay"),
+                    "direct_stream": source.get("SupportsDirectStream"),
+                    "transcoding": source.get("SupportsTranscoding"),
+                    "requires_opening": source.get("RequiresOpening"),
+                    "video_type": source.get("VideoType"),
+                    "streams": len(source.get("MediaStreams") or []),
+                }
+                for source in media_sources
+            ],
+        )
+
         return {
-            "MediaSources": [self.media_source_dto(source) for source in sources],
+            "MediaSources": media_sources,
             "PlaySessionId": self._play_session_id(item_id, season, episode),
             "ErrorCode": None if sources else "NoCompatibleStream",
         }

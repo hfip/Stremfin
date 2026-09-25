@@ -742,6 +742,15 @@ class PlaybackResolver:
         release_type: str | None,
         size: int | None,
     ) -> str:
+        # Stremio's `name` field is already the presentation string chosen by
+        # the upstream addon.  AIOStreams Custom Formatter writes its formatted
+        # stream name here, so preserve it instead of replacing it with a
+        # Stremfin-generated label.  This keeps user-created AIOStreams formats
+        # intact for Jellyfin clients that expose MediaSource.Name (notably Rex).
+        upstream_name = cls._upstream_display_name(candidate)
+        if upstream_name:
+            return upstream_name
+
         technical = " • ".join(
             part for part in (quality, release_type) if part
         ).strip()
@@ -752,12 +761,12 @@ class PlaybackResolver:
             if details:
                 return f"{addon_name} • {details}"
 
-            title = cls._clean_title(candidate.title or candidate.name or "")
+            title = cls._clean_title(candidate.title or "")
             if title and title.lower() != addon_name.lower():
                 return f"{title} • {addon_name}"
             return addon_name
 
-        title = cls._clean_title(candidate.title or candidate.name or "")
+        title = cls._clean_title(candidate.title or "")
         details = " • ".join(part for part in (technical, size_label) if part)
         if details and title:
             if details.lower() in title.lower():
@@ -765,17 +774,51 @@ class PlaybackResolver:
             return f"{title} • {details}"
         return details or title or "Stremfin Source"
 
+    @classmethod
+    def _upstream_display_name(cls, candidate: StreamCandidate) -> str | None:
+        value = cls._clean_title(candidate.name or "")
+        if not value:
+            return None
+
+        # Generic labels carry no useful formatter information.  Let the
+        # Stremfin fallback build a richer label from structured metadata.
+        generic = {
+            "file", "files", "stream", "streams", "source", "sources",
+            "ملف", "ملفات", "مصدر", "مصادر", "stremio stream",
+        }
+        if value.casefold() in generic:
+            return None
+
+        # Never surface URLs, credentials, opaque hashes or raw file paths as
+        # a MediaSource name.  Besides being noisy in clients, query strings
+        # can contain API keys/tokens.
+        lowered = value.lower()
+        if (
+            "://" in lowered
+            or "api_key=" in lowered
+            or "apikey=" in lowered
+            or "token=" in lowered
+            or "x-plex-token=" in lowered
+            or lowered.startswith("magnet:?")
+        ):
+            return None
+        if re.fullmatch(r"[a-f0-9_-]{28,}", value, re.IGNORECASE):
+            return None
+        if re.fullmatch(r"[^\s]+\.(?:mkv|mp4|m4v|avi|mov|webm|ts|m2ts)", value, re.IGNORECASE):
+            return None
+
+        return value
+
     @staticmethod
     def _clean_title(value: str) -> str:
         text = re.sub(r"\s+", " ", str(value or "")).strip()
-        return text if len(text) <= 100 else text[:97].rstrip() + "..."
+        return text if len(text) <= 160 else text[:157].rstrip() + "..."
 
     @staticmethod
     def _addon_name(candidate: StreamCandidate) -> str | None:
-        name = re.sub(r"\s+", " ", str(candidate.name or "")).strip()
-        if name and len(name) <= 60:
-            return name
-
+        # `candidate.name` is the Stremio stream display name, not reliably the
+        # addon name.  In particular AIOStreams uses it for Custom Formatter
+        # output, so deriving addon identity from it would destroy that format.
         addon_url = str(candidate.addon_url or "").strip()
         if addon_url:
             try:

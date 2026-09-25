@@ -748,28 +748,12 @@ def _episode_dto(
         "ProviderIds": {},
         "UserData": _userdata(),
         "MediaStreams": [],
-        # Advertise the Jellyfin multi-version contract cheaply on Episode
-        # item documents.  Some clients decide whether to expose a source /
-        # version picker before they request PlaybackInfo.  Two lightweight
-        # stand-ins are enough to advertise that capability without resolving
-        # every Stremio addon while the user is only opening an episode page.
-        # PlaybackInfo remains the authoritative path and replaces these with
-        # the real ranked MediaSources when playback/source selection starts.
-        "MediaSources": [
-            _media_source(episode_id, name),
-            _media_source(
-                f"{episode_id}:version:2",
-                f"{name} (2)",
-            ),
-        ],
-        "AlternateMediaSources": [
-            _media_source(episode_id, name),
-            _media_source(
-                f"{episode_id}:version:2",
-                f"{name} (2)",
-            ),
-        ],
-        "MediaSourceCount": 2,
+        # Real selectable versions are attached on the individual Episode route.
+        # Keep the base DTO honest: never advertise synthetic placeholder
+        # sources that clients could mistake for playable versions.
+        "MediaSources": [],
+        "AlternateMediaSources": [],
+        "MediaSourceCount": 0,
     }
 
 
@@ -1664,24 +1648,34 @@ async def _attach_playback_media(
     requests. Catalog browsing remains lightweight and never resolves streams.
     """
 
-    try:
-        media_sources = await PlaybackResolver(runtime).media_sources(
-            content_id,
-            season,
-            episode,
-        )
-    except Exception:
-        media_sources = []
+    async def _resolve_media_sources():
+        try:
+            return await PlaybackResolver(runtime).media_sources(
+                content_id,
+                season,
+                episode,
+            )
+        except Exception:
+            return []
 
-    try:
-        subtitle_streams = await _subtitle_streams(
-            runtime,
-            content_id,
-            season,
-            episode,
-        )
-    except Exception:
-        subtitle_streams = []
+    async def _resolve_subtitle_streams():
+        try:
+            return await _subtitle_streams(
+                runtime,
+                content_id,
+                season,
+                episode,
+            )
+        except Exception:
+            return []
+
+    # Source and subtitle addons are independent. Running both lookups together
+    # preserves the complete pre-playback picker while avoiding unnecessary
+    # serial waiting on the individual Movie/Episode detail route.
+    media_sources, subtitle_streams = await asyncio.gather(
+        _resolve_media_sources(),
+        _resolve_subtitle_streams(),
+    )
 
     media_sources = _prefer_media_source(
         list(media_sources),
@@ -1740,6 +1734,7 @@ async def _attach_playback_media(
         # selector, so advertise both views of the same resolved set.
         dto["MediaSources"] = media_sources
         dto["AlternateMediaSources"] = list(media_sources[1:])
+        dto["MediaSourceCount"] = len(media_sources)
 
         # Jellyfin clients may inspect the top-level MediaStreams before
         # opening PlaybackInfo. Mirror the first source's streams there.
@@ -1747,7 +1742,9 @@ async def _attach_playback_media(
             media_sources[0].get("MediaStreams") or []
         )
     else:
+        dto["MediaSources"] = []
         dto["AlternateMediaSources"] = []
+        dto["MediaSourceCount"] = 0
 
         # Preserve subtitle discovery even if no playable stream was resolved.
         dto["MediaStreams"] = subtitle_streams
@@ -2651,12 +2648,30 @@ async def get_item(
         await _apply_watch_userdata(dto, settings)
         state = await _watch_store(settings).get(USER_ID, str(dto["Id"]))
 
-        # Keep the individual Episode item route lightweight.  Resolving real
-        # Stremio sources (and subtitles) here made USER_ITEM wait for the full
-        # addon timeout window even though clients request PlaybackInfo when
-        # they actually need playable versions.  _episode_dto already carries
-        # cheap multi-version markers/stubs; PlaybackInfo remains authoritative.
-        return dto
+        # Individual Episode details must expose the real selectable versions.
+        # SenPlayer/Rex inspect the Item DTO before PlaybackInfo, so placeholder
+        # MediaSources hide addon/quality choices and can also suppress external
+        # subtitle discovery.  Resolve the same real sources used by PlaybackInfo
+        # while preserving watch-state preferences.  _attach_playback_media runs
+        # source and subtitle discovery concurrently to keep this path as fast as
+        # possible without replacing the user's source choice with an auto-pick.
+        return await _attach_playback_media(
+            dto,
+            runtime,
+            str(series_id),
+            season_number,
+            episode_number,
+            preferred_media_source_id=(
+                state.media_source_id
+                if state is not None
+                else None
+            ),
+            preferred_subtitle_stream_index=(
+                state.subtitle_stream_index
+                if state is not None
+                else None
+            ),
+        )
 
     collection = (
         TVSHOWS_VIEW_ID

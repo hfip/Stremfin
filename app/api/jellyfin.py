@@ -748,12 +748,28 @@ def _episode_dto(
         "ProviderIds": {},
         "UserData": _userdata(),
         "MediaStreams": [],
+        # Advertise the Jellyfin multi-version contract cheaply on Episode
+        # item documents.  Some clients decide whether to expose a source /
+        # version picker before they request PlaybackInfo.  Two lightweight
+        # stand-ins are enough to advertise that capability without resolving
+        # every Stremio addon while the user is only opening an episode page.
+        # PlaybackInfo remains the authoritative path and replaces these with
+        # the real ranked MediaSources when playback/source selection starts.
         "MediaSources": [
+            _media_source(episode_id, name),
             _media_source(
-                episode_id,
-                name,
-            )
+                f"{episode_id}:version:2",
+                f"{name} (2)",
+            ),
         ],
+        "AlternateMediaSources": [
+            _media_source(episode_id, name),
+            _media_source(
+                f"{episode_id}:version:2",
+                f"{name} (2)",
+            ),
+        ],
+        "MediaSourceCount": 2,
     }
 
 
@@ -2635,23 +2651,12 @@ async def get_item(
         await _apply_watch_userdata(dto, settings)
         state = await _watch_store(settings).get(USER_ID, str(dto["Id"]))
 
-        return await _attach_playback_media(
-            dto,
-            runtime,
-            series_id,
-            season_number,
-            episode_number,
-            preferred_media_source_id=(
-                state.media_source_id
-                if state is not None
-                else None
-            ),
-            preferred_subtitle_stream_index=(
-                state.subtitle_stream_index
-                if state is not None
-                else None
-            ),
-        )
+        # Keep the individual Episode item route lightweight.  Resolving real
+        # Stremio sources (and subtitles) here made USER_ITEM wait for the full
+        # addon timeout window even though clients request PlaybackInfo when
+        # they actually need playable versions.  _episode_dto already carries
+        # cheap multi-version markers/stubs; PlaybackInfo remains authoritative.
+        return dto
 
     collection = (
         TVSHOWS_VIEW_ID

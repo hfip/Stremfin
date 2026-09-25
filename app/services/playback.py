@@ -63,6 +63,7 @@ class ResolvedMediaSource:
     quality: str | None = None
     release_type: str | None = None
     bitrate: int | None = None
+    size: int | None = None
     width: int | None = None
     height: int | None = None
     video_codec: str | None = None
@@ -259,6 +260,7 @@ class PlaybackResolver:
             "quality": source.quality,
             "release_type": source.release_type,
             "bitrate": source.bitrate,
+            "size": source.size,
             "width": source.width,
             "height": source.height,
             "video_codec": source.video_codec,
@@ -289,6 +291,7 @@ class PlaybackResolver:
                     quality=raw.get("quality"),
                     release_type=raw.get("release_type"),
                     bitrate=raw.get("bitrate"),
+                    size=raw.get("size"),
                     width=raw.get("width"),
                     height=raw.get("height"),
                     video_codec=raw.get("video_codec"),
@@ -527,11 +530,13 @@ class PlaybackResolver:
         addon_name = self._addon_name(candidate)
         quality = self._quality_label(candidate)
         release_type = self._release_type(candidate)
+        size = self._size_bytes(candidate)
         display_name = self._display_name(
             candidate,
             addon_name,
             quality,
             release_type,
+            size,
         )
         container = self._container(
             resolved_url,
@@ -561,6 +566,7 @@ class PlaybackResolver:
                 candidate.name,
                 candidate.description,
             ),
+            size=size,
             width=width,
             height=height,
             video_codec=self._video_codec(
@@ -689,7 +695,7 @@ class PlaybackResolver:
             "EncoderProtocol": None,
             "Type": "Default",
             "Container": source.container,
-            "Size": None,
+            "Size": source.size,
             "Name": source.name,
             "IsRemote": True,
             "ETag": None,
@@ -734,14 +740,17 @@ class PlaybackResolver:
         addon_name: str | None,
         quality: str | None,
         release_type: str | None,
+        size: int | None,
     ) -> str:
-        technical = " ".join(
+        technical = " • ".join(
             part for part in (quality, release_type) if part
         ).strip()
+        size_label = cls._format_size(size)
 
         if addon_name:
-            if technical:
-                return f"{technical} • {addon_name}"
+            details = " • ".join(part for part in (technical, size_label) if part)
+            if details:
+                return f"{addon_name} • {details}"
 
             title = cls._clean_title(candidate.title or candidate.name or "")
             if title and title.lower() != addon_name.lower():
@@ -749,11 +758,12 @@ class PlaybackResolver:
             return addon_name
 
         title = cls._clean_title(candidate.title or candidate.name or "")
-        if technical and title:
-            if technical.lower() in title.lower():
+        details = " • ".join(part for part in (technical, size_label) if part)
+        if details and title:
+            if details.lower() in title.lower():
                 return title
-            return f"{technical} • {title}"
-        return technical or title or "Stremfin Source"
+            return f"{title} • {details}"
+        return details or title or "Stremfin Source"
 
     @staticmethod
     def _clean_title(value: str) -> str:
@@ -813,6 +823,45 @@ class PlaybackResolver:
         if "camrip" in text or re.search(r"\bcam\b", text):
             return "CAM"
         return None
+
+    @classmethod
+    def _size_bytes(cls, candidate: StreamCandidate) -> int | None:
+        # Stremio commonly exposes an exact byte size as behaviorHints.videoSize.
+        # Prefer structured metadata and only fall back to human-readable text.
+        hints = candidate.behavior_hints if isinstance(candidate.behavior_hints, dict) else {}
+        raw = candidate.raw if isinstance(candidate.raw, dict) else {}
+        for value in (hints.get("videoSize"), raw.get("size"), raw.get("videoSize")):
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                continue
+            if parsed > 0:
+                return parsed
+
+        text = cls._candidate_text(candidate)
+        match = re.search(r"(?<![\w.])(\d+(?:\.\d+)?)\s*(TB|GB|MB|KB|TiB|GiB|MiB|KiB)\b", text, re.IGNORECASE)
+        if not match:
+            return None
+        value = float(match.group(1))
+        unit = match.group(2).lower()
+        factors = {
+            "kb": 1000, "mb": 1000**2, "gb": 1000**3, "tb": 1000**4,
+            "kib": 1024, "mib": 1024**2, "gib": 1024**3, "tib": 1024**4,
+        }
+        return int(value * factors[unit])
+
+    @staticmethod
+    def _format_size(size: int | None) -> str | None:
+        if not size or size <= 0:
+            return None
+        if size >= 1024**3:
+            value = size / 1024**3
+            return f"{value:.2f} GB" if value < 10 else f"{value:.1f} GB"
+        if size >= 1024**2:
+            return f"{size / 1024**2:.0f} MB"
+        if size >= 1024:
+            return f"{size / 1024:.0f} KB"
+        return f"{size} B"
 
     @staticmethod
     def _candidate_text(candidate: StreamCandidate) -> str:

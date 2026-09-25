@@ -143,13 +143,14 @@ class PlaybackResolver:
     ) -> str | None:
         content_id = str(item_id or "").strip()
         requested = str(media_source_id or "").strip()
+        media_identity = self._media_identity(content_id, season, episode)
 
         # A client may ask to play a MediaSource after the full source-list
         # cache has changed or expired.  Prefer the exact URL that Stremfin
         # previously issued for that stable MediaSource Id.
         if content_id and requested:
             issued = await issued_source_cache.get(
-                self._issued_source_key(content_id, requested)
+                self._issued_source_key(media_identity, requested)
             )
             if isinstance(issued, str):
                 issued_url = issued.strip()
@@ -306,13 +307,14 @@ class PlaybackResolver:
         results: list[ResolvedMediaSource] = []
         seen_urls: set[str] = set()
         seen_sources: set[str] = set()
+        media_identity = self._media_identity(item_id, season, episode)
 
         for candidate, resolved_url in resolved_pairs:
             if not resolved_url or not self._is_client_playable_url(resolved_url):
                 continue
 
             url_identity = self._url_identity(resolved_url)
-            source_identity = self._candidate_identity(item_id, candidate)
+            source_identity = self._candidate_identity(media_identity, candidate)
 
             if url_identity in seen_urls or source_identity in seen_sources:
                 continue
@@ -321,7 +323,7 @@ class PlaybackResolver:
             seen_sources.add(source_identity)
             results.append(
                 self._resolved_source(
-                    item_id=item_id,
+                    item_id=media_identity,
                     candidate=candidate,
                     resolved_url=resolved_url,
                 )
@@ -914,6 +916,26 @@ class PlaybackResolver:
         return hashlib.sha256(
             identity.encode("utf-8", errors="ignore")
         ).hexdigest()[:32]
+
+    @staticmethod
+    def _media_identity(
+        item_id: str,
+        season: int | None,
+        episode: int | None,
+    ) -> str:
+        """Return a stable playable identity for one movie or one episode.
+
+        Stremio resolves episodes with the parent series id plus season/episode.
+        Jellyfin clients, however, expect MediaSource ids to belong to the exact
+        playable item. Including the episode coordinates prevents source ids and
+        issued-source mappings from being shared across different episodes.
+        """
+        content_id = str(item_id or "").strip()
+        season_number = PlaybackResolver._safe_int(season)
+        episode_number = PlaybackResolver._safe_int(episode)
+        if season_number is not None and episode_number is not None:
+            return f"{content_id}:s{season_number}e{episode_number}"
+        return content_id
 
     @staticmethod
     def _play_session_id(

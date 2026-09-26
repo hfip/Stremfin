@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 from typing import Any
 from uuid import uuid4
@@ -27,6 +28,7 @@ from app.services.watch_state import WatchStateStore
 
 
 router = APIRouter()
+logger = logging.getLogger("uvicorn.error")
 
 USER_ID = "stremfin-user"
 TOKENS: set[str] = set()
@@ -93,6 +95,60 @@ def _userdata() -> dict[str, Any]:
         "Played": False,
         "UnplayedItemCount": 0,
     }
+
+
+def _playback_capabilities_summary(body: dict[str, Any]) -> dict[str, Any]:
+    """Return a privacy-safe, coarse summary of a Jellyfin PlaybackInfo body."""
+
+    profile = body.get("DeviceProfile") or body.get("deviceProfile") or {}
+    if not isinstance(profile, dict):
+        profile = {}
+
+    def _count(*names: str) -> int:
+        for name in names:
+            value = profile.get(name)
+            if isinstance(value, list):
+                return len(value)
+        return 0
+
+    def _value(*names: str):
+        for name in names:
+            if name in body:
+                return body.get(name)
+        return None
+
+    return {
+        "max_bitrate": _value("MaxStreamingBitrate", "maxStreamingBitrate"),
+        "max_audio_channels": _value("MaxAudioChannels", "maxAudioChannels"),
+        "direct_play": _value("EnableDirectPlay", "enableDirectPlay"),
+        "direct_stream": _value("EnableDirectStream", "enableDirectStream"),
+        "transcode": _value("EnableTranscoding", "enableTranscoding"),
+        "direct_profiles": _count("DirectPlayProfiles", "directPlayProfiles"),
+        "codec_profiles": _count("CodecProfiles", "codecProfiles"),
+        "container_profiles": _count("ContainerProfiles", "containerProfiles"),
+        "subtitle_profiles": _count("SubtitleProfiles", "subtitleProfiles"),
+        "transcode_profiles": _count("TranscodingProfiles", "transcodingProfiles"),
+    }
+
+
+def _log_playback_capabilities(body: dict[str, Any]) -> None:
+    summary = _playback_capabilities_summary(body)
+    logger.info(
+        "[CLIENT-CAPS] max_bitrate=%s max_audio_channels=%s "
+        "direct_play=%s direct_stream=%s transcode=%s "
+        "direct_profiles=%s codec_profiles=%s container_profiles=%s "
+        "subtitle_profiles=%s transcode_profiles=%s",
+        summary["max_bitrate"],
+        summary["max_audio_channels"],
+        summary["direct_play"],
+        summary["direct_stream"],
+        summary["transcode"],
+        summary["direct_profiles"],
+        summary["codec_profiles"],
+        summary["container_profiles"],
+        summary["subtitle_profiles"],
+        summary["transcode_profiles"],
+    )
 
 
 def _watch_store(settings: Settings | None = None) -> WatchStateStore:
@@ -3451,6 +3507,10 @@ async def playback_info_post(
             body = parsed
     except Exception:
         pass
+
+    # Diagnostic only: record coarse playback capabilities without logging
+    # UserId, MediaSourceId, profile names, URLs, headers, tokens, or codecs.
+    _log_playback_capabilities(body)
 
     user_id = body.get("UserId") or body.get("userId")
     return await _playback_response(

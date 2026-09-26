@@ -55,7 +55,6 @@ class ResolvedMediaSource:
     item_id: str
     url: str
     name: str
-    description: str | None
     container: str | None
     protocol: str
     source_type: str
@@ -555,7 +554,6 @@ class PlaybackResolver:
             item_id=item_id,
             url=resolved_url,
             name=display_name,
-            description=self._upstream_description(candidate),
             container=container,
             protocol="Http",
             source_type=str(candidate.source or "direct"),
@@ -698,7 +696,7 @@ class PlaybackResolver:
             "Type": "Default",
             "Container": source.container,
             "Size": source.size,
-            "Name": PlaybackResolver._media_source_label(source),
+            "Name": source.name,
             "IsRemote": True,
             "ETag": None,
             "RunTimeTicks": None,
@@ -775,43 +773,6 @@ class PlaybackResolver:
                 return title
             return f"{title} • {details}"
         return details or title or "Stremfin Source"
-
-    @classmethod
-    def _media_source_label(cls, source: ResolvedMediaSource) -> str:
-        # Match AIOStreams Jellyfin behaviour: the version-picker label is the
-        # formatter name plus formatter description.  Direct addons that do not
-        # provide a useful description keep the Stremfin fallback name only.
-        parts = [source.name]
-        if source.description:
-            parts.append(source.description)
-        label = "\n".join(part.strip() for part in parts if part and part.strip())
-        return label or "Stremfin Source"
-
-    @classmethod
-    def _upstream_description(cls, candidate: StreamCandidate) -> str | None:
-        value = str(candidate.description or "").strip()
-        if not value:
-            return None
-
-        # Preserve formatter layout/newlines, but never expose credentials or
-        # a raw playable URL through MediaSource.Name.
-        lowered = value.lower()
-        if any(secret in lowered for secret in (
-            "api_key=", "apikey=", "token=", "x-plex-token=", "magnet:?"
-        )):
-            return None
-        if re.fullmatch(r"https?://\S+", value, re.IGNORECASE):
-            return None
-
-        lines = [line.strip() for line in value.splitlines() if line.strip()]
-        safe_lines = [
-            line for line in lines
-            if not re.fullmatch(r"https?://\S+", line, re.IGNORECASE)
-        ]
-        if not safe_lines:
-            return None
-        text = "\n".join(safe_lines)
-        return text if len(text) <= 600 else text[:597].rstrip() + "..."
 
     @classmethod
     def _upstream_display_name(cls, candidate: StreamCandidate) -> str | None:

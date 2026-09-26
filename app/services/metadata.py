@@ -218,23 +218,60 @@ class MetadataService:
             page_limit = self.DEFAULT_CATALOG_PAGE_SIZE
 
         page_limit = min(page_limit, 100)
-        foreground_limit = min(max(start + page_limit, page_limit), 100)
-        items = await self.catalog(
-            kind=kind,
-            limit=foreground_limit,
-            selected=selected,
+        endpoint_type = "series" if kind in ("series", "tv") else "movie"
+        catalogs = self._selected_catalogs(selected, endpoint_type)
+        if not catalogs:
+            return {
+                "items": [],
+                "start_index": start,
+                "limit": page_limit,
+                "has_more": False,
+                "total_record_count": 0,
+                "is_total_exact": True,
+            }
+
+        # Fetch one item beyond the requested page.  That gives us a real,
+        # observed indication that another Jellyfin page exists without
+        # inventing a catalogue total.
+        required_count = min(
+            start + page_limit + 1,
+            self.MAX_CATALOG_ITEMS,
+        )
+        windows = await asyncio.gather(
+            *(
+                self._catalog_window(catalog, required_count)
+                for catalog in catalogs
+            ),
+            return_exceptions=True,
         )
 
+        unique: dict[str, dict] = {}
+        all_exhausted = True
+        for window in windows:
+            if isinstance(window, BaseException):
+                all_exhausted = False
+                continue
+            self._merge_unique(unique, window["items"])
+            all_exhausted = all_exhausted and bool(window["exhausted"])
+
+        items = list(unique.values())
+        end = min(start + page_limit, len(items))
+        page_items = items[start:end]
+        has_observed_next = len(items) > end
+        has_more = has_observed_next or not all_exhausted
+
+        # When every selected catalogue has reached its real end, the count is
+        # exact.  Otherwise this is only the number of unique records we have
+        # actually observed so far; no synthetic large total is advertised.
         total = len(items)
-        end = min(start + page_limit, total)
 
         return {
-            "items": items[start:end],
+            "items": page_items,
             "start_index": start,
             "limit": page_limit,
-            "has_more": end < total,
+            "has_more": has_more,
             "total_record_count": total,
-            "is_total_exact": False,
+            "is_total_exact": all_exhausted,
         }
 
     def _selected_catalogs(
@@ -268,18 +305,82 @@ class MetadataService:
         self,
         catalog: dict,
         required_count: int,
-    ) -> list[dict]:
+    ) -> dict:
         try:
-            requested = max(1, min(int(required_count), 100))
+            requested = max(1, min(int(required_count), self.MAX_CATALOG_ITEMS))
         except (TypeError, ValueError):
             requested = self.DEFAULT_CATALOG_PAGE_SIZE
 
-        items = await self._cached_catalog_page(
+        first_page = await self._cached_catalog_page(
             catalog,
             skip=0,
             use_skip=False,
         )
-        return items[:requested]
+        items = self._deduplicate_items(first_page)
+
+        # A catalogue that does not advertise Stremio's `skip` extra has no
+        # safe paging contract.  Preserve its existing base response exactly
+        # instead of guessing unsupported URLs.
+        if not self._supports_skip(catalog):
+            return {"items": items[:requested], "exhausted": True}
+
+        if not first_page:
+            return {"items": [], "exhausted": True}
+
+        exhausted = False
+        pages_fetched = 1
+        next_skip = len(first_page)
+        seen_page_signatures: set[tuple[str, ...]] = set()
+
+        first_signature = tuple(
+            identity
+            for identity in (self._identity(item) for item in first_page)
+            if identity
+        )
+        if first_signature:
+            seen_page_signatures.add(first_signature)
+
+        while (
+            len(items) < requested
+            and pages_fetched < self.MAX_CATALOG_PAGES_PER_ADDON
+            and len(items) < self.MAX_CATALOG_ITEMS
+        ):
+            page = await self._cached_catalog_page(
+                catalog,
+                skip=next_skip,
+                use_skip=True,
+            )
+            pages_fetched += 1
+
+            if not page:
+                exhausted = True
+                break
+
+            signature = tuple(
+                identity
+                for identity in (self._identity(item) for item in page)
+                if identity
+            )
+            if signature and signature in seen_page_signatures:
+                # Broken addons occasionally ignore skip and return the first
+                # page forever.  Stop immediately rather than looping.
+                exhausted = True
+                break
+            if signature:
+                seen_page_signatures.add(signature)
+
+            before = len(items)
+            items = self._deduplicate_items([*items, *page])
+            next_skip += len(page)
+
+            if len(items) == before:
+                exhausted = True
+                break
+
+        return {
+            "items": items[:requested],
+            "exhausted": exhausted,
+        }
 
     async def _cached_catalog_page(
         self,

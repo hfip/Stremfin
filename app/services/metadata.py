@@ -29,8 +29,6 @@ class MetadataService:
     """
 
     DEFAULT_CATALOG_PAGE_SIZE = 20
-    MAX_CATALOG_PAGES_PER_ADDON = 250
-    MAX_CATALOG_ITEMS = 20000
     METADATA_FOREGROUND_BUDGET_SECONDS = 1.25
 
     def __init__(self, settings: Settings):
@@ -233,10 +231,7 @@ class MetadataService:
         # Fetch one item beyond the requested page.  That gives us a real,
         # observed indication that another Jellyfin page exists without
         # inventing a catalogue total.
-        required_count = min(
-            start + page_limit + 1,
-            self.MAX_CATALOG_ITEMS,
-        )
+        required_count = start + page_limit + 1
         windows = await asyncio.gather(
             *(
                 self._catalog_window(catalog, required_count)
@@ -307,7 +302,7 @@ class MetadataService:
         required_count: int,
     ) -> dict:
         try:
-            requested = max(1, min(int(required_count), self.MAX_CATALOG_ITEMS))
+            requested = max(1, int(required_count))
         except (TypeError, ValueError):
             requested = self.DEFAULT_CATALOG_PAGE_SIZE
 
@@ -318,12 +313,10 @@ class MetadataService:
         )
         items = self._deduplicate_items(first_page)
 
-        # A catalogue that does not advertise Stremio's `skip` extra has no
-        # safe paging contract.  Preserve its existing base response exactly
-        # instead of guessing unsupported URLs.
-        if not self._supports_skip(catalog):
-            return {"items": items[:requested], "exhausted": True}
-
+        # Some real-world Stremio addons implement `skip` correctly but omit
+        # it from the manifest's `extra` declaration.  We therefore probe the
+        # next page safely even when `skip` is not advertised.  The repeated
+        # page/no-growth guards below stop immediately if an addon ignores it.
         if not first_page:
             return {"items": [], "exhausted": True}
 
@@ -340,11 +333,7 @@ class MetadataService:
         if first_signature:
             seen_page_signatures.add(first_signature)
 
-        while (
-            len(items) < requested
-            and pages_fetched < self.MAX_CATALOG_PAGES_PER_ADDON
-            and len(items) < self.MAX_CATALOG_ITEMS
-        ):
+        while len(items) < requested:
             page = await self._cached_catalog_page(
                 catalog,
                 skip=next_skip,

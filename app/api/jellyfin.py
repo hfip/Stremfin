@@ -2059,6 +2059,20 @@ async def get_items(
             or (start_index + len(metas))
         )
 
+        # Jellyfin/Emby clients decide whether to request another page from
+        # TotalRecordCount; they do not understand Stremfin's internal
+        # `has_more` flag.  When MetadataService has observed (or still has a
+        # valid reason to expect) another catalogue page, advertise exactly
+        # one record beyond the current page boundary.  This is a monotonic
+        # lower-bound rather than a fabricated catalogue size, and it lets the
+        # client keep paging past 100 until the upstream catalogue is truly
+        # exhausted.
+        if bool(catalog_result.get("has_more")):
+            catalog_total = max(
+                catalog_total,
+                start_index + len(metas) + 1,
+            )
+
     # Some Stremio movie catalogs expose a generic preview name such as
     # "stream" even though their /meta/movie/{id}.json endpoint contains the
     # real title. Enrich only those malformed/generic movie entries, and do it

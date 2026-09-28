@@ -269,6 +269,52 @@ class MetadataService:
             "is_total_exact": all_exhausted,
         }
 
+    async def catalog_window(
+        self,
+        kind: str,
+        required_count: int,
+        selected: list[dict],
+    ) -> dict:
+        """Load a progressive unsliced catalog window for server-side sorting."""
+        try:
+            requested = max(1, int(required_count))
+        except (TypeError, ValueError):
+            requested = self.DEFAULT_CATALOG_PAGE_SIZE
+
+        endpoint_type = "series" if kind in ("series", "tv") else "movie"
+        catalogs = self._selected_catalogs(selected, endpoint_type)
+        if not catalogs:
+            return {
+                "items": [],
+                "has_more": False,
+                "total_record_count": 0,
+                "is_total_exact": True,
+            }
+
+        windows = await asyncio.gather(
+            *(self._catalog_window(catalog, requested) for catalog in catalogs),
+            return_exceptions=True,
+        )
+
+        unique: dict[str, dict] = {}
+        all_exhausted = True
+        for window in windows:
+            if isinstance(window, BaseException):
+                all_exhausted = False
+                continue
+            self._merge_unique(unique, window["items"])
+            all_exhausted = all_exhausted and bool(window["exhausted"])
+
+        items = list(unique.values())
+        has_more = len(items) > requested or not all_exhausted
+        visible = items[:requested]
+        return {
+            "items": visible,
+            "has_more": has_more,
+            "total_record_count": len(visible),
+            "is_total_exact": all_exhausted,
+        }
+
     def _selected_catalogs(
         self,
         selected: list[dict],

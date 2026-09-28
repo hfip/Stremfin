@@ -2042,6 +2042,18 @@ async def get_items(
         )
         metas = sortable_metas[start_index:start_index + limit]
         catalog_total = len(sortable_metas)
+        logger.info(
+            "[CATALOG-PAGE] mode=sorted parent=%s kind=%s start=%s limit=%s "
+            "window=%s loaded=%s sliced=%s total=%s",
+            parent_id,
+            kind,
+            start_index,
+            limit,
+            sort_window,
+            len(sortable_metas),
+            len(metas),
+            catalog_total,
+        )
     else:
         catalog_result = await service.catalog_page(
             kind=kind,
@@ -2195,6 +2207,18 @@ async def get_items(
     #
     # Subtitle resolution is deferred until an individual media item /
     # playback path requires it.
+
+    logger.info(
+        "[CATALOG-PAGE] mode=return parent=%s kind=%s start=%s limit=%s "
+        "returned=%s total=%s sort_by=%s",
+        parent_id,
+        kind,
+        start_index,
+        limit,
+        len(page),
+        catalog_total,
+        bool(sort_by),
+    )
 
     return {
         "Items": page,

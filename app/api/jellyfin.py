@@ -2025,16 +2025,18 @@ async def get_items(
         # window, apply the client's requested Jellyfin/Emby order, then slice
         # the requested page. Without SortBy, the native Stremio catalog order
         # remains completely untouched.
-        sort_window = min(
-            MAX_CATALOG_WINDOW,
-            max(start_index + limit, MAX_PAGE_SIZE),
-        )
-        sortable_metas = await service.catalog(
+        # Request one look-ahead record beyond the page boundary.  The
+        # progressive metadata window follows Stremio `skip` pages and is not
+        # capped by the legacy 100-item catalog() foreground limit.
+        sort_window = max(start_index + limit + 1, MAX_PAGE_SIZE + 1)
+        sorted_result = await service.catalog_window(
             kind=kind,
-            limit=sort_window,
+            required_count=sort_window,
             selected=selected_for_page,
         )
-        sortable_metas = _deduplicate_metas(list(sortable_metas))
+        sortable_metas = _deduplicate_metas(
+            list(sorted_result.get("items") or [])
+        )
         sortable_metas = _sort_catalog_metas(
             sortable_metas,
             sort_by,
@@ -2042,6 +2044,11 @@ async def get_items(
         )
         metas = sortable_metas[start_index:start_index + limit]
         catalog_total = len(sortable_metas)
+        if bool(sorted_result.get("has_more")):
+            catalog_total = max(
+                catalog_total,
+                start_index + len(metas) + 1,
+            )
         logger.info(
             "[CATALOG-PAGE] mode=sorted parent=%s kind=%s start=%s limit=%s "
             "window=%s loaded=%s sliced=%s total=%s",

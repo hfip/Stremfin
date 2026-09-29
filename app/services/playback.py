@@ -743,10 +743,9 @@ class PlaybackResolver:
         size: int | None,
     ) -> str:
         # Stremio's `name` field is already the presentation string chosen by
-        # the upstream addon.  AIOStreams Custom Formatter writes its formatted
-        # stream name here, so preserve it instead of replacing it with a
-        # Stremfin-generated label.  This keeps user-created AIOStreams formats
-        # intact for Jellyfin clients that expose MediaSource.Name (notably Rex).
+        # the upstream addon. Preserve that value instead of replacing it with a
+        # Stremfin-generated label so addon-defined formatting remains intact for
+        # Jellyfin clients that expose MediaSource.Name (notably Rex).
         upstream_name = cls._upstream_display_name(candidate)
         if upstream_name:
             return upstream_name
@@ -817,8 +816,8 @@ class PlaybackResolver:
     @staticmethod
     def _addon_name(candidate: StreamCandidate) -> str | None:
         # `candidate.name` is the Stremio stream display name, not reliably the
-        # addon name.  In particular AIOStreams uses it for Custom Formatter
-        # output, so deriving addon identity from it would destroy that format.
+        # addon name. Some addons use it for custom display formatting, so
+        # deriving addon identity from it would destroy that presentation.
         addon_url = str(candidate.addon_url or "").strip()
         if addon_url:
             try:

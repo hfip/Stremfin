@@ -1745,8 +1745,8 @@ async def _attach_playback_media(
 
     # Jellyfin-compatible episode identity: some clients (notably Rex) expect
     # the primary episode MediaSource Id to match the playable Episode item Id.
-    # Remux follows the same convention. Keep alternate source ids unchanged so
-    # source selection remains stable, and give every source a matching ETag.
+    # Keep alternate source ids unchanged so source selection remains stable,
+    # and give every source a matching ETag.
     if media_sources:
         for media_source in media_sources:
             source_id = str(media_source.get("Id") or "").strip()
@@ -3463,8 +3463,8 @@ async def _playback_response(
         preferred_media_source_id,
         preferred_subtitle_stream_index,
     )
-    # Match Jellyfin/Remux episode identity semantics for clients that bind the
-    # selected version to the playable Episode Id. Movies keep their existing
+    # Match Jellyfin-compatible episode identity semantics for clients that bind
+    # the selected version to the playable Episode Id. Movies keep their existing
     # source ids because they are already working across the tested clients.
     if media_sources:
         for media_source in media_sources:

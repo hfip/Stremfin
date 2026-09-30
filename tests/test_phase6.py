@@ -16,7 +16,10 @@ def test_exact_series_hierarchy_dtos(monkeypatch):
     assert season["ParentId"] == "tt-live" and season["SeriesName"] == "Live Series" and season["UserData"]["Played"] is False
     assert episode["Type"] == "Episode" and episode["MediaType"] == "Video" and episode["SeasonId"] == "tt-live:s2"
     assert episode["ParentId"] == "tt-live:s2" and episode["ParentIndexNumber"] == 2 and episode["IndexNumber"] == 3
-    assert episode["RunTimeTicks"] == 25200000000 and episode["EnableMediaSourceDisplay"] is True and episode["MediaSources"]
+    assert episode["RunTimeTicks"] == 25200000000 and episode["EnableMediaSourceDisplay"] is True
+    # Listing DTOs deliberately omit synthetic versions; the individual episode route
+    # resolves real selectable sources. Keep this contract distinct from PlaybackInfo.
+    assert episode["MediaSources"] == [] and episode["MediaSourceCount"] == 0
 
 
 def test_async_ttl_cache_coalesces_requests():

@@ -1,3 +1,9 @@
+> ⚖️ **إخلاء مسؤولية** — هذا المشروع لا يستضيف أي محتوى ولا يوفّر روابط بث أو مفاتيح. يعمل فقط على مصادر يضيفها المستخدم بنفسه، واستخدامه مسؤولية المستخدم ووفق قوانين بلده.
+>
+> **Disclaimer** — This project hosts no content and provides no streams or keys. It works only with sources the user supplies, and use is the user's responsibility under their local law.
+
+---
+
 # Stremfin
 
 **A lightweight FastAPI bridge that turns Stremio addons into a Jellyfin / Emby compatible library.**
